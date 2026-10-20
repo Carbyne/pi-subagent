@@ -231,6 +231,22 @@ async function t3() {
     await sleep(900);
     results["T3 compaction drain"] = sent.some((m) => m.text === "force-compact-on-send please");
 
+    // 5b) /queue + /idlequeue commands bypass the prompt
+    idle = false;
+    await commands["queue"]("cmd-queue msg", ctx);
+    results["T3 /queue enqueues"] =
+        sent.every((m) => m.text !== "cmd-queue msg") && status.some((v) => v && /queued/.test(v));
+    await commands["idlequeue"]("cmd-idle msg", ctx);
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 1, jobs: [] });
+    idle = true;
+    await fire("agent_settled", {});
+    await sleep(900);
+    results["T3 /queue delivers"] = sent.some((m) => m.text === "cmd-queue msg");
+    results["T3 /idlequeue held by bg"] = !sent.some((m) => m.text === "cmd-idle msg");
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
+    await sleep(900);
+    results["T3 /idlequeue delivers after bg"] = sent.some((m) => m.text === "cmd-idle msg");
+
     // 6) /unqueue restores to editor
     idle = false;
     await submit("recall me", "q");
