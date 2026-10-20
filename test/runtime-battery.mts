@@ -164,7 +164,7 @@ async function t3() {
 
     const fixture = "/tmp/steer-fixture";
     fs.mkdirSync(`${fixture}/.pi`, { recursive: true });
-    fs.writeFileSync(`${fixture}/.pi/settings.json`, JSON.stringify({ agentSteer: { promptWhenIdleWithBg: true } }));
+    fs.writeFileSync(`${fixture}/.pi/settings.json`, JSON.stringify({ agentSteer: { } }));
     const ctx: any = {
         cwd: fixture,
         hasUI: true,
