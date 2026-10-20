@@ -740,6 +740,8 @@ export default function (pi: ExtensionAPI) {
 		status: "running" | "idle" | "exited" | "failed" | "killed";
 		rpc: RpcSubagent;
 		adoptedJobId?: string;
+		/** Resolves the current bg-jobs adoption round (settle or exit). */
+		adoptionResolve?: (code: number | null) => void;
 		startTmp?: { dir: string; filePath: string };
 		startedAt: number;
 		endAt?: number;
@@ -837,8 +839,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Hand the child to pi-bg-jobs for lifecycle (list/kill/sidebar, and
-	 *  ralph-loop job-awareness via bg-jobs:status). Graceful when absent. */
-	async function adoptToBgJobs(r: BgRun): Promise<void> {
+	 *  ralph-loop job-awareness via bg-jobs:status). Graceful when absent.
+	 *  Adoption is ROUND-based: `exit` resolves when the current work round
+	 *  ends (settle or process exit) — NOT at process death — because the RPC
+	 *  child stays warm for follow-ups (idleTtl). Counting the warm process as
+	 *  a "running job" would block ralph-loop indefinitely after the task is
+	 *  actually done. New work opens a fresh adopted entry via openAdoption. */
+	async function adoptToBgJobs(r: BgRun, exit: Promise<number | null>): Promise<void> {
 		const result = await new Promise<{ ok: boolean; id?: string; error?: string }>((resolve) => {
 			let settled = false;
 			const done = (res: { ok: boolean; id?: string; error?: string }) => {
@@ -855,7 +862,7 @@ export default function (pi: ExtensionAPI) {
 					name: `subagent:${r.name ?? r.agent}`,
 					pid: r.rpc.proc.pid ?? -1,
 					logPath: r.rpc.logPath,
-					exit: r.rpc.exit,
+					exit,
 					proc: r.rpc.proc,
 					silent: true, // we emit richer completion notices ourselves
 					disablePromptStall: true, // JSONL stream — no interactive-prompt heuristic
@@ -869,12 +876,27 @@ export default function (pi: ExtensionAPI) {
 		if (result.ok) r.adoptedJobId = result.id;
 	}
 
+	/** Open a bg-jobs adoption for the current work round (idempotent). */
+	function openAdoption(r: BgRun): void {
+		if (r.adoptionResolve) return; // a round is already being counted
+		let resolve!: (code: number | null) => void;
+		const exit = new Promise<number | null>((res) => (resolve = res));
+		r.adoptionResolve = (code) => {
+			r.adoptionResolve = undefined;
+			resolve(code);
+		};
+		void adoptToBgJobs(r, exit);
+	}
+
 	function bindRunLifecycle(r: BgRun): void {
 		r.rpc.onSettled(() => {
 			if (r.gen !== state.gen) return;
 			if (r.status === "exited" || r.status === "failed" || r.status === "killed") return;
 			r.status = "idle";
 			r.settleRounds++;
+			// Round over: close the adopted bg-job entry so ralph-loop resumes
+			// its follow-ups (the warm RPC process must not count as "busy").
+			r.adoptionResolve?.(0);
 			scheduleIdleKill(r);
 			const out = clip(r.rpc.finalOutput(), 3000) || "(no text output)";
 			const u = r.rpc.usage;
@@ -908,6 +930,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			r.endAt = Date.now();
 			r.exitCode = code;
+			r.adoptionResolve?.(code ?? null); // close any still-open round
 			r.status = r.wasKilled || r.rpc.proc.signalCode
 				? "killed"
 				: r.status === "idle" || code === 0
@@ -1044,7 +1067,7 @@ Follow these instructions exactly for your response.`
 		runs.set(id, run);
 		registerQuestionRoute(run);
 		bindRunLifecycle(run);
-		void adoptToBgJobs(run);
+		openAdoption(run);
 		rpc.prompt(`Task: ${fullTask}`);
 		if (opts.peekAfterMs > 0) schedulePeek(run, opts.peekAfterMs);
 		return run;
@@ -1867,6 +1890,7 @@ Follow these instructions exactly for your response.`
 						r.idleKillTimer = undefined;
 					}
 					r.status = "running";
+					openAdoption(r); // new work round → count as a running bg-job again
 					return textResult(`Delivered "${clip(p.text, 60)}" to ${r.id} as ${mode === "steer" ? "steer (before its next LLM call)" : "follow-up (after it stops)"}.`);
 				}
 				case "reply": {
