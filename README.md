@@ -10,6 +10,10 @@ cannot pollute yours. Supports single, parallel, and chained execution.
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **Streaming output**: See tool calls and progress as they happen
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
+- **Background mode**: `background: true` detaches the run — keep working, get notified when it
+  settles, steer it mid-flight, and answer its questions ([Background subagents](#background-subagents))
+- **Subagent ⇄ main messaging**: subagents get an `ask_main_agent` tool that blocks until the main
+  agent replies (background runs) or until *you* answer via an input dialog (foreground runs)
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
@@ -109,11 +113,64 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 
 ## Tool Modes
 
+Exactly **one** mode per call:
+
 | Mode | Parameter | Description |
 |------|-----------|-------------|
-| Single | `{ agent, task }` | One agent, one task |
-| Parallel | `{ tasks: [...] }` | Multiple agents; sequential by default, set `concurrency` to run N at once |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Single | `{ agent, task }` | One agent, one task — **both keys required**. A task with no agent runs on the bundled `worker` agent |
+| Parallel | `{ tasks: [...], concurrency }` | ⚠ runs **sequentially** unless `concurrency > 1` (default `1`) — don't assume parallelism from the name |
+| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder (foreground only) |
+
+`background: true` applies to Single and Parallel modes.
+
+## Background subagents
+
+`subagent { agent: "worker", task: "…", background: true }` launches the child as a long-lived
+`pi --mode rpc` process and returns immediately with an id (`sa-<pid>-<n>`). You are automatically
+notified (via injected messages) when:
+
+- the run **settles** (final output included; the process stays alive for a TTL so you can send
+  more work),
+- it **asks a question** via its `ask_main_agent` tool (it blocks until you `reply`),
+- a **peek reminder** fires (`peekAfter`) showing recent turns so you can course-correct.
+
+Manage them with the `subagent_control` tool:
+
+| Action | Purpose |
+|--------|---------|
+| `list` | running + recent runs, pending-question flags |
+| `peek { id, last }` | last few turns (assistant text, tool calls, results) |
+| `send { id, text, deliverAs }` | steer mid-turn or queue a follow-up; wakes an idle run |
+| `reply { id, text }` | answer a pending `ask_main_agent` question — the subagent is blocked until you do |
+| `abort { id }` | interrupt the current turn, keep the process |
+| `kill { id }` | terminate |
+| `wait { id, timeout }` | block until settled/exited |
+| `remind { id, after }` | (re)arm the peek reminder, e.g. `after: "5m"` |
+
+Plus `/subagents` for a quick list.
+
+**pi-bg-jobs integration**: background subagents are adopted as real bg-jobs (via the
+`bg-jobs:adopt` event) — they appear in `bg_jobs` list/kill and the sidebar, and
+`pi-ralph-loop` treats them as running jobs (no follow-up fires while they work). Without
+pi-bg-jobs loaded, runs are tracked internally instead.
+
+Settings (`settings.json` → `"subagent"`):
+
+```jsonc
+{
+  "subagent": {
+    "peekAfter": "10m",     // default reminder delay for background runs (absent/0 = off)
+    "idleTtl": "10m",       // how long a settled background run stays alive for follow-ups
+    "askTimeout": "10m",    // max block time for ask_main_agent
+    "notifyMode": "steer",  // notice delivery: steer | followUp
+    "maxBackground": 8,     // concurrent background subagents
+    "peekTurns": 6          // ring entries shown in reminder peeks
+  }
+}
+```
+
+**Note on `/reload`**: background runs survive a reload (re-adopted by the fresh extension
+instance via shared global state). A session switch (new/resume/fork) kills them.
 
 ## Subagent Environment
 

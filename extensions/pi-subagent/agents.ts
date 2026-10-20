@@ -21,7 +21,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
-	source: "builtin" | "user" | "project";
+	source: "builtin" | "user" | "project" | "inline";
 	filePath: string;
 }
 
