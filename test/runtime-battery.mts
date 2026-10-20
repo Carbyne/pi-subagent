@@ -162,7 +162,11 @@ async function t3() {
     };
     mod.default(pi);
 
+    const fixture = "/tmp/steer-fixture";
+    fs.mkdirSync(`${fixture}/.pi`, { recursive: true });
+    fs.writeFileSync(`${fixture}/.pi/settings.json`, JSON.stringify({ agentSteer: { promptWhenIdleWithBg: true } }));
     const ctx: any = {
+        cwd: fixture,
         hasUI: true,
         isIdle: () => idle,
         ui: {
@@ -246,6 +250,24 @@ async function t3() {
     for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
     await sleep(900);
     results["T3 /idlequeue delivers after bg"] = sent.some((m) => m.text === "cmd-idle msg");
+
+    // 5c) promptWhenIdleWithBg: idle agent + bg jobs → prompt appears
+    idle = true;
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 2, jobs: [] });
+    let rs7 = await submit("bg-idle prompt msg", "a");
+    results["T3 idle+bg prompts"] = rs7.some((x: any) => x?.action === "handled");
+    results["T3 idle+bg a held"] = !sent.some((m) => m.text === "bg-idle prompt msg");
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
+    await sleep(900);
+    results["T3 idle+bg a delivers"] = sent.some((m) => m.text === "bg-idle prompt msg");
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 2, jobs: [] });
+    await submit("send-now msg", "s");
+    results["T3 idle+bg s sends now"] = sent.some((m) => m.text === "send-now msg");
+    // idle with no bg jobs → normal pass-through, no prompt
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
+    await sleep(1200);
+    const rs8 = await submit("plain idle msg");
+    results["T3 idle-no-bg passthrough"] = rs8.some((x: any) => x?.action === "continue");
 
     // 6) /unqueue restores to editor
     idle = false;
