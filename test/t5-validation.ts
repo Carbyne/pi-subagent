@@ -51,6 +51,19 @@ const goodErr = toolResults().some(
 );
 console.log("helpful error:", goodErr);
 
+// wait for the round-1 agent to settle before sending round 2 (rpc rejects
+// mid-stream prompts without streamingBehavior)
+{
+    const t0 = Date.now();
+    let settles = 0;
+    while (Date.now() - t0 < 60_000) {
+        settles = events.filter((e) => e.type === "agent_settled").length;
+        if (settles >= 1) break;
+        await sleep(1000);
+    }
+    await sleep(500);
+}
+
 // 2) task without agent → auto worker (should just run and return output)
 send({
     type: "prompt",

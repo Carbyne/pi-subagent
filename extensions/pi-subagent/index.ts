@@ -1197,7 +1197,7 @@ Follow these instructions exactly for your response.`
 							systemPrompt: "You are a capable general-purpose subagent. Complete the task fully, then report the result concisely.",
 						} as InlineAgentConfig;
 			}
-			const hasSingle = hasAgent && hasTask;
+			const hasSingle = Boolean(effectiveAgent) && hasTask;
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
 			if (modeCount !== 1) {
