@@ -194,6 +194,28 @@ async function t3() {
         return await Promise.all(ps);
     }
 
+    /** Poll until the extension delivers `text` (nudging settle so the
+     *  watchdog/flush keeps trying). Robust against grace + serialized
+     *  multi-item flushes, unlike fixed sleeps. */
+    async function expectSent(text: string, timeoutMs = 9000): Promise<boolean> {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) {
+            if (sent.some((m) => m.text === text)) return true;
+            await fire("agent_settled", {});
+            await sleep(400);
+        }
+        return sent.some((m) => m.text === text);
+    }
+    async function expectNotSent(text: string, ms: number): Promise<boolean> {
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+            if (sent.some((m) => m.text === text)) return false;
+            await fire("agent_settled", {});
+            await sleep(150);
+        }
+        return true;
+    }
+
     // 1) idle pass-through
     idle = true;
     let rs = await submit("hello while idle");
@@ -207,21 +229,17 @@ async function t3() {
 
     // 3) settle → deliver via sendUserMessage WITHOUT deliverAs (no core queue widget)
     idle = true;
-    await fire("agent_settled", {});
-    await sleep(900);
-    results["T3 flush on settle"] = sent.some((m) => m.text === "queued msg" && !m.opts?.deliverAs);
+    results["T3 flush on settle"] =
+        (await expectSent("queued msg")) && sent.some((m) => m.text === "queued msg" && !m.opts?.deliverAs);
 
     // 4) 'a' waits for bg jobs
     idle = false;
     await submit("idle-only msg", "a");
     for (const fn of bus["bg-jobs:status"]) fn({ running: 1, jobs: [] });
     idle = true;
-    await fire("agent_settled", {});
-    await sleep(900);
-    results["T3 waitidle held by bg"] = !sent.some((m) => m.text === "idle-only msg");
+    results["T3 waitidle held by bg"] = await expectNotSent("idle-only msg", 1200);
     for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
-    await sleep(900);
-    results["T3 waitidle delivered after bg"] = sent.some((m) => m.text === "idle-only msg");
+    results["T3 waitidle delivered after bg"] = await expectSent("idle-only msg");
 
     // 5) compaction: steer choice parks instead of erroring; drains after compact
     idle = false;
@@ -232,34 +250,29 @@ async function t3() {
     harnessCompacting = false;
     await fire("session_compact", {});
     idle = true;
-    await sleep(900);
-    results["T3 compaction drain"] = sent.some((m) => m.text === "force-compact-on-send please");
+    results["T3 compaction drain"] = await expectSent("force-compact-on-send please");
 
     // 5b) /queue + /idlequeue commands bypass the prompt
     idle = false;
     await commands["queue"]("cmd-queue msg", ctx);
     results["T3 /queue enqueues"] =
-        sent.every((m) => m.text !== "cmd-queue msg") && status.some((v) => v && /queued/.test(v));
+        !sent.some((m) => m.text === "cmd-queue msg") && status.some((v) => v && /queued/.test(v));
     await commands["idlequeue"]("cmd-idle msg", ctx);
     for (const fn of bus["bg-jobs:status"]) fn({ running: 1, jobs: [] });
     idle = true;
-    await fire("agent_settled", {});
-    await sleep(900);
-    results["T3 /queue delivers"] = sent.some((m) => m.text === "cmd-queue msg");
-    results["T3 /idlequeue held by bg"] = !sent.some((m) => m.text === "cmd-idle msg");
+    results["T3 /queue delivers"] = await expectSent("cmd-queue msg");
+    results["T3 /idlequeue held by bg"] = await expectNotSent("cmd-idle msg", 1200);
     for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
-    await sleep(900);
-    results["T3 /idlequeue delivers after bg"] = sent.some((m) => m.text === "cmd-idle msg");
+    results["T3 /idlequeue delivers after bg"] = await expectSent("cmd-idle msg");
 
     // 5c) promptWhenIdleWithBg: idle agent + bg jobs → prompt appears
     idle = true;
     for (const fn of bus["bg-jobs:status"]) fn({ running: 2, jobs: [] });
     let rs7 = await submit("bg-idle prompt msg", "a");
     results["T3 idle+bg prompts"] = rs7.some((x: any) => x?.action === "handled");
-    results["T3 idle+bg a held"] = !sent.some((m) => m.text === "bg-idle prompt msg");
+    results["T3 idle+bg a held"] = await expectNotSent("bg-idle prompt msg", 800);
     for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
-    await sleep(900);
-    results["T3 idle+bg a delivers"] = sent.some((m) => m.text === "bg-idle prompt msg");
+    results["T3 idle+bg a delivers"] = await expectSent("bg-idle prompt msg");
     for (const fn of bus["bg-jobs:status"]) fn({ running: 2, jobs: [] });
     await submit("send-now msg", "s");
     results["T3 idle+bg s sends now"] = sent.some((m) => m.text === "send-now msg");
@@ -269,9 +282,30 @@ async function t3() {
     const rs8 = await submit("plain idle msg");
     results["T3 idle-no-bg passthrough"] = rs8.some((x: any) => x?.action === "continue");
 
+    // 5d) waitidle grace: bg-jobs status flips to 0 IMMEDIATELY but its
+    // completion notice comes ~coalesceMs later — delivery must not jump it.
+    idle = true;
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 1, jobs: [] });
+    await commands["idlequeue"]("grace race msg", ctx);
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] }); // drain now
+    results["T3 waitidle respects grace"] = await expectNotSent("grace race msg", 600);
+    results["T3 waitidle delivers after grace"] = await expectSent("grace race msg");
+
+    // 5e) notice wakes agent (busy turn) → delivery additionally waits for settle
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 1, jobs: [] });
+    await commands["idlequeue"]("notice first msg", ctx);
+    for (const fn of bus["bg-jobs:status"]) fn({ running: 0, jobs: [] });
+    await sleep(300);
+    idle = false; // the coalesced completion notice starts a turn
+    results["T3 no delivery during notice turn"] = await expectNotSent("notice first msg", 1400); // grace elapses mid-turn
+    idle = true;
+    await fire("agent_settled", {});
+    results["T3 delivers after notice turn settles"] = await expectSent("notice first msg");
+
     // 6) /unqueue restores to editor
     idle = false;
     await submit("recall me", "q");
+    await sleep(200);
     await commands["unqueue"]("", ctx);
     results["T3 unqueue to editor"] = (globalThis as any).__editorText === "recall me";
 }
