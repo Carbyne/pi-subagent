@@ -138,6 +138,7 @@ async function t3() {
     const bus: Record<string, Array<Function>> = {};
     let idle = false;
     let harnessCompacting = false;
+    let rejectOnce: string | undefined;
 
     const pi: any = {
         on(ev: string, fn: Function) {
@@ -148,8 +149,13 @@ async function t3() {
         },
         sendUserMessage(text: string, opts?: any) {
             if (harnessCompacting && /force-compact-on-send/.test(text))
-                throw new Error("Cannot submit a prompt while compaction is in progress");
+                return Promise.reject(new Error("Cannot submit a prompt while compaction is in progress"));
+            if (rejectOnce === text) {
+                rejectOnce = undefined;
+                return Promise.reject(new Error("Agent is not idle (completion notice raced the send)"));
+            }
             sent.push({ text, opts });
+            return Promise.resolve();
         },
         events: {
             on(ev: string, fn: Function) {
@@ -301,6 +307,17 @@ async function t3() {
     idle = true;
     await fire("agent_settled", {});
     results["T3 delivers after notice turn settles"] = await expectSent("notice first msg");
+
+    // 5f) async send rejection must NOT lose the item (the exact
+    //     "prompts vanish while bg jobs run" bug: bg-jobs' coalesced notice
+    //     starts a turn between isIdle() and sendUserMessage → reject).
+    idle = true;
+    rejectOnce = "async reject msg";
+    await commands["queue"]("async reject msg", ctx);
+    await sleep(600); // give the (rejected) send a chance to swallow it
+    results["T3 async reject keeps item queued"] =
+        !sent.some((m) => m.text === "async reject msg") && status.some((v) => v && /1 queued/.test(v));
+    results["T3 async reject retried to delivery"] = await expectSent("async reject msg", 12000);
 
     // 6) /unqueue restores to editor
     idle = false;
