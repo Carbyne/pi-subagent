@@ -169,6 +169,7 @@ Settings (`settings.json` → `"subagent"`):
     "peekTurns": 6,            // ring entries shown in reminder peeks
     "controls": {              // ── operator control plane (all optional) ──
       "background": true,      // false → background mode rejected (even as default)
+      "foreground": true,      // false → blocking calls rejected; EVERYTHING must detach (chain is foreground-only, so it's blocked too)
       "parallel": true,        // false → tasks[] with >1 item rejected
       "chain": true,           // false → chain[] rejected
       "inlineAgents": true,    // false → inline {systemPrompt,…} objects rejected

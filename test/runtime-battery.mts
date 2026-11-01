@@ -12,12 +12,12 @@ import * as fs from "node:fs";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const results: Record<string, boolean | string> = {};
 
-async function rpcSession(extraArgs: string[], tag: string) {
+async function rpcSession(extraArgs: string[], tag: string, cwd = "/home/jakob/git_projects") {
     const log = `/tmp/rt-${tag}.log`;
     fs.writeFileSync(log, "");
     const child = spawn("pi", ["--mode", "rpc", "--no-session", ...extraArgs], {
         stdio: ["pipe", "pipe", "pipe"],
-        cwd: "/home/jakob/git_projects",
+        cwd,
     });
     const events: any[] = [];
     let buf = "";
@@ -405,6 +405,34 @@ async function t7() {
 if (!process.env.SKIP_T12 && !process.env.SKIP_T7) {
     console.log("── T7 broken model e2e (installed)");
     await t7();
+    console.log(JSON.stringify(results, null, 0));
+}
+
+// ── T8: controls.foreground=false blocks blocking calls (project-settings fixture) ──
+async function t8() {
+    const fx = "/tmp/sa-fg-fixture";
+    fs.mkdirSync(`${fx}/.pi`, { recursive: true });
+    fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { controls: { foreground: false } } }));
+    const s = await rpcSession(["--thinking", "off"], "foreground", fx);
+    s.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", task="say HI", and background:false. '
+            + "Report the tool's result verbatim, then stop.",
+    });
+    const deadline = Date.now() + 120_000;
+    let blocked = false;
+    while (Date.now() < deadline) {
+        await sleep(1500);
+        if (JSON.stringify(s.events).includes("foreground mode is disabled")) { blocked = true; break; }
+    }
+    results["T8 foreground blocked by controls"] = blocked;
+    s.stop();
+    await sleep(1000);
+}
+if (!process.env.SKIP_T12) {
+    console.log("── T8 foreground-block e2e (installed)");
+    await t8();
     console.log(JSON.stringify(results, null, 0));
 }
 const fails = Object.entries(results).filter(([, v]) => v !== true);

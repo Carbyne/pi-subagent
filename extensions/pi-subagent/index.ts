@@ -329,6 +329,7 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 interface SubagentControls {
     /** Capabilities the MAIN agent may use — deny to lock the surface down. */
     background: boolean; // allow background mode
+    foreground: boolean; // allow blocking foreground calls (false → everything must detach; also blocks chain)
     parallel: boolean; // allow tasks[] (len > 1)
     chain: boolean; // allow chain[]
     inlineAgents: boolean; // allow inline {systemPrompt,…} agent objects
@@ -343,6 +344,7 @@ interface SubagentControls {
 
 const CONTROLS_DEFAULTS: SubagentControls = {
     background: true,
+    foreground: true,
     parallel: true,
     chain: true,
     inlineAgents: true,
@@ -417,7 +419,7 @@ function loadSubagentSettings(cwd: string): SaCfg {
     const ctl = s.controls as Record<string, unknown> | undefined;
     if (ctl && typeof ctl === "object") {
         const c: SubagentControls = { ...cfg.controls };
-        for (const k of ["background", "parallel", "chain", "inlineAgents", "nesting", "piArgs"] as const)
+        for (const k of ["background", "foreground", "parallel", "chain", "inlineAgents", "nesting", "piArgs"] as const)
             if (typeof ctl[k] === "boolean") c[k] = ctl[k] as boolean;
         if (ctl.agentScope === "user" || ctl.agentScope === "project" || ctl.agentScope === "both") c.agentScope = ctl.agentScope;
         if (Array.isArray(ctl.allowedAgents)) c.allowedAgents = (ctl.allowedAgents as unknown[]).filter((x): x is string => typeof x === "string");
@@ -1340,6 +1342,12 @@ Follow these instructions exactly for your response.`
 				if (bgExplicit) return ctlErr("background mode is disabled (controls.background=false)");
 				wantsBackground = false; // default was only a suggestion
 			}
+			// Anti-stall: block FOREGROUND execution — every subagent must detach
+			// (chain is inherently foreground, so it is blocked by this too).
+			if (!wantsBackground && !ctl.foreground)
+				return ctlErr(
+					"foreground mode is disabled (controls.foreground=false) — every subagent must run detached: rerun with background:true (chain mode is foreground-only and therefore also blocked)"
+				);
 			if (hasChain && !ctl.chain) return ctlErr("chain mode is disabled (controls.chain=false)");
 			if (hasTasks && (params.tasks?.length ?? 0) > 1 && !ctl.parallel)
 				return ctlErr("parallel mode (more than one task) is disabled (controls.parallel=false)");
