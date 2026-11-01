@@ -136,6 +136,25 @@ list; ephemeral (`--no-session`) parents get a clear error to use `fresh`.
 - Operator restriction: `controls.sessionModes` (e.g. `["fresh"]` forbids context
   inheritance entirely; `["fork"]` forces context-carrying delegation)
 
+#### Fork tool policy (cache-first, runtime-enforced)
+
+Fork children default to **parent-parity**: identical tool declarations, verbatim
+parent system prompt (no persona append unless `"subagent".forkUseAgentPersona`),
+inherited thinking level — so the parent's cached KV prefix is reused from the
+child's first request. Restrictions are runtime, not declaration:
+
+| Lever | Where | Effect |
+|-------|-------|--------|
+| `forkToolMode` | settings / per-call | `"guard"` (default): stable declarations + `tool_call` blocking (cache-safe). `"real"`: pi-native `setActiveTools` loadout — removed tools truly vanish from declarations; removals cost one recompute per fork lineage (siblings/rounds share it). `cli` = legacy alias for real |
+| `blockTools` | settings (globs) / per-call `blockTools` | denied tools; defaults add `subagent, search_subagent, subagent_control` unless `allowNesting` |
+| first-prompt banner | automatic | `[Policy] Disabled for this session: …` prepended to the child's task (new tokens — cache-neutral), so the model knows without trying |
+| `childToolAdditions` | settings (default true) | whether children may declare tools the parent lacks (companion's `ask_main_agent`); false = strict parity |
+| `forkUseAgentPersona` | settings (default false) | append the agent's persona system prompt to forks too (usually undesired — forks continue *you*, not a persona) |
+
+The measured difference on a shared-prefix gateway: `guard` child first request
+`cacheRead ≈ parent's cached tokens`; `real` with removals pays one cold prefill,
+then all subsequent forks/siblings hit the child lineage.
+
 ## Background subagents
 
 `subagent { agent: "worker", task: "…", background: true }` launches the child as a long-lived

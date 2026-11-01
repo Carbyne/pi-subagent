@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.3
+
+### Changed — fork tool policy now "parent-parity + runtime guard" (the simple, cache-safe design)
+
+- Fork children keep the parent's **exact tool declarations** (no
+  `--exclude-tools`, no `--tools`, no persona append, no auto system-prompt
+  drift — the copied parent system entry is used verbatim; thinking level is
+  inherited). Zero head divergence ⇒ the parent's cached KV prefix is reused
+  from the child's very first request; sibling forks and later rounds share it.
+- Restrictions are **runtime checks**: the companion blocks denied tools via
+  pi's `tool_call` permission hook (policies: agent defaults
+  `{subagent, search_subagent, subagent_control}` unless `allowNesting`, plus
+  `"subagent".blockTools` settings and per-call `blockTools`), backed by the
+  `PI_SUBAGENT_CHILD` execute-level guard.
+- The child is **told** what is disabled: a `[Policy] Disabled for this session…`
+  banner is auto-prepended to the first prompt (new tokens ⇒ cache-neutral), so
+  the model rarely even attempts a blocked call.
+- Children may NOT declare tools the parent lacks (e.g. companion's
+  `ask_main_agent`) unless `"subagent".childToolAdditions: true` (default true).
+- New settings: `forkToolMode` (`"guard"` default | `"real"` = pi-native
+  `setActiveTools` loadout patch, removals cost one recompute per lineage;`cli`
+  legacy alias), `forkUseAgentPersona` (default false), `childToolAdditions`
+  (default true), `blockTools` (operator-wide globs).
+
+## 0.4.2
+
+### Changed
+
+- **Cache-preserving forks.** Fork children no longer pass `--exclude-tools` —
+  measured on the gateway: removals rewrite the request head (`params.tools`
+  resolves from the transcript's system fold), so the entire copied history
+  billed cold (`cacheRead: 0`). Additions (companion `ask_main_agent`, appended
+  system sections) are cache-safe and stay. Fork children now keep the parent's
+  EXACT tool declarations; nested delegation is instead blocked by
+  1. an appended "Forked session rules" system section (rides after history), and
+  2. a runtime guard: `PI_SUBAGENT_CHILD=1` makes the `subagent` tool refuse
+     execution in fork children (unless `allowNesting:true` AND the operator's
+     `controls.nesting:true`).
+  Result: fork child first request now hits the parent's KV prefix
+  (`cacheRead` observed ≈ half the prompt tokens vs 0 before).
+- Fresh (non-fork) children keep CLI exclusions unchanged — no prefix to protect.
+
+## 0.4.1
+
+### Fixed
+
+- Foreground subagent children ran in the wrong mode (print instead of RPC) due to a
+  partially-applied edit batch — single-task foreground calls could hang waiting for
+  agent_settled that print mode never emits. Unified on the RPC child.
+- Forking a live session copied the parent's in-flight dangling toolCall, making the
+  child stall minutes trying to resolve the call that spawned it. Forks now use a
+  sanitized raw-line copy (tail truncation only, kept bytes untouched).
+
 ## 0.4.0
 
 ### Added

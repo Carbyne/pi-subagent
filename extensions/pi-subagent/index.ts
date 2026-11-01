@@ -420,6 +420,7 @@ interface SubagentControls {
     inlineAgents: boolean; // allow inline {systemPrompt,…} agent objects
     nesting: boolean; // allow allowNesting:true
     piArgs: boolean; // allow custom piArgs passthrough
+    childExtensions: boolean; // allow childExtensions (extra --extension code in children)
     /** Which session modes the model may request. "fork" continues THIS session's
      *  conversation; "fresh" starts empty. Operators can pin e.g. ["fresh"]. */
     sessionModes: SessionMode[];
@@ -432,6 +433,23 @@ interface SubagentControls {
 
 type SessionMode = "fresh" | "fork";
 
+interface ChildToolPolicy {
+	enforce: "cli" | "guard" | "real";
+	blockExtra?: string[];
+	extensions?: string[];
+	/** Parent's live thinking level — thinking renders into the prompt, so a
+	 *  mismatch silently invalidates the parent KV prefix for forks. */
+	thinking?: string;
+	/** Fork: append the agent persona/system prompt (default false — the
+	 *  parent's copied system prompt is used verbatim, zero drift). */
+	usePersona?: boolean;
+	/** Fork: allow tools the parent does not declare (ask_main_agent etc.). */
+	allowAdditions?: boolean;
+	/** Fork: "[Disabled tools …]" banner auto-prepended to the FIRST prompt
+	 *  (new tokens anyway — cache-neutral) so the model knows without trying. */
+	disabledNote?: string;
+}
+
 const CONTROLS_DEFAULTS: SubagentControls = {
     background: true,
     foreground: true,
@@ -440,6 +458,7 @@ const CONTROLS_DEFAULTS: SubagentControls = {
     inlineAgents: true,
     nesting: false,
     piArgs: true,
+    childExtensions: false,
     sessionModes: ["fresh", "fork"],
 };
 
@@ -460,8 +479,23 @@ interface SaCfg {
     defaultBackground: boolean;
     /** Default child session: "fresh" (empty context) or "fork" (continue this session). */
     sessionMode: SessionMode;
-    /** Kill + report a background run that produced ZERO events within this window
-     *  (broken model/auth config would otherwise sit there doing nothing). */
+    /** How FORK children enforce tool restrictions: "real" (default) applies
+     *  pi's NATIVE loadout (companion setActiveTools at child session_start —
+     *  transcript-consistent toolsAdded/toolsRemoved patch; the model never
+     *  sees removed tools). Removals re-fold the request head, so the FIRST
+     *  fork pays one recompute — siblings/rounds then share that lineage's
+     *  cache. "guard" keeps the parent's declarations byte-stable (parent's
+     *  own cached prefix is reused immediately) and denies at call time. */
+    forkToolMode: "real" | "guard" | "cli"; // "cli" = legacy alias for "real"
+    /** Fork children skip the agent's persona/system prompt entirely (use the
+     *  parent's copied system prompt verbatim) unless true — zero drift. */
+    forkUseAgentPersona: boolean;
+    /** Allow children to declare tools the parent lacks (currently the
+     *  companion's ask_main_agent). False = strict parent-parity. */
+    childToolAdditions: boolean;
+    /** Operator-wide tools denied to ALL children (globs). */
+    blockTools: string[];
+    /** How long a background child may stay silent before being killed & reported. */
     startupTimeoutMs: number;
     /** Capability/model control plane for what the main agent may do. */
     controls: SubagentControls;
@@ -476,6 +510,10 @@ const SA_CFG_DEFAULTS: SaCfg = {
     peekTurns: 6,
     defaultBackground: false,
     sessionMode: "fresh",
+    forkToolMode: "guard",
+    forkUseAgentPersona: false,
+    childToolAdditions: true,
+    blockTools: [],
     startupTimeoutMs: 120_000,
     controls: { ...CONTROLS_DEFAULTS },
 };
@@ -506,6 +544,10 @@ function loadSubagentSettings(cwd: string): SaCfg {
     if (typeof s.peekTurns === "number" && s.peekTurns > 0) cfg.peekTurns = Math.floor(s.peekTurns);
     if (typeof s.defaultBackground === "boolean") cfg.defaultBackground = s.defaultBackground;
     if (s.sessionMode === "fresh" || s.sessionMode === "fork") cfg.sessionMode = s.sessionMode;
+    if (s.forkToolMode === "guard" || s.forkToolMode === "cli" || s.forkToolMode === "real") cfg.forkToolMode = s.forkToolMode;
+    if (typeof s.forkUseAgentPersona === "boolean") cfg.forkUseAgentPersona = s.forkUseAgentPersona;
+    if (typeof s.childToolAdditions === "boolean") cfg.childToolAdditions = s.childToolAdditions;
+    if (Array.isArray(s.blockTools)) cfg.blockTools = (s.blockTools as unknown[]).filter((x): x is string => typeof x === "string");
     try {
         if (s.startupTimeout !== undefined) cfg.startupTimeoutMs = parseDuration(s.startupTimeout);
     } catch {
@@ -514,7 +556,7 @@ function loadSubagentSettings(cwd: string): SaCfg {
     const ctl = s.controls as Record<string, unknown> | undefined;
     if (ctl && typeof ctl === "object") {
         const c: SubagentControls = { ...cfg.controls };
-        for (const k of ["background", "foreground", "parallel", "chain", "inlineAgents", "nesting", "piArgs"] as const)
+        for (const k of ["background", "foreground", "parallel", "chain", "inlineAgents", "nesting", "piArgs", "childExtensions"] as const)
             if (typeof ctl[k] === "boolean") c[k] = ctl[k] as boolean;
         if (Array.isArray(ctl.sessionModes)) {
             const sms = (ctl.sessionModes as unknown[]).filter((x): x is SessionMode => x === "fresh" || x === "fork");
@@ -572,6 +614,7 @@ async function runSingleAgent(
 	controls?: SubagentControls,
 	startupTimeoutMs?: number,
 	forkFrom?: { sessionFile: string },
+	toolPolicy?: ChildToolPolicy,
 ): Promise<SingleResult> {
 	const target = resolveAgentTarget(agentName, agents, parentModel);
 	if (!target.ok) {
@@ -615,26 +658,54 @@ async function runSingleAgent(
 	args.push("--no-themes", "--no-prompt-templates");
 	if (agent.model) args.push("--model", agent.model);
 	const noTools = agent.tools && agent.tools.length === 0;
-	if (agent.tools && agent.tools.length > 0) {
-		args.push("--tools", agent.tools.join(","));
-	} else if (noTools) {
-		args.push("--no-tools"); // Explicitly disable all tools
-	}
-	// Recursion guard: by default a subagent must not spawn its own subagents
-	// (each is a full pi startup; parallel mode would fan out unboundedly).
-	// Skip when tools are already fully disabled. Set allowNesting to opt in.
-	if (!allowNesting && !noTools) {
-		args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+	const enforce = toolPolicy?.enforce ?? "cli";
+	// Thinking renders into the prompt — forks must mirror the parent's level.
+	if (forkFrom) args.push("--thinking", toolPolicy?.thinking ?? "off");
+	let guardPolicyJson: string | undefined;
+	let loadoutJson: string | undefined;
+	const blockForDelegation = (): string[] => {
+		const block = [...(toolPolicy?.blockExtra ?? [])];
+		if (!allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+		return block;
+	};
+	if (enforce === "guard" && forkFrom) {
+		// Cache-preserving: keep the parent's EXACT declarations; restrictions
+		// ride as a runtime policy enforced by companion via tool_call blocking.
+		const block = blockForDelegation();
+		if (noTools) block.push("*");
+		const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
+		if (allow || block.length > 0) guardPolicyJson = JSON.stringify({ allow, block });
+	} else if (forkFrom) {
+		// "real": pi-native loadout via companion at child session_start —
+		// removed tools are truly absent from the model's declarations.
+		const block = blockForDelegation();
+		const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
+		if (allow || block.length > 0) loadoutJson = JSON.stringify({ allow, block });
+	} else {
+		// Fresh children: plain CLI flags (no prefix to protect).
+		if (agent.tools && agent.tools.length > 0) {
+			args.push("--tools", agent.tools.join(","));
+		} else if (noTools) {
+			args.push("--no-tools"); // Explicitly disable all tools
+		}
+		// Recursion guard: by default a subagent must not spawn its own subagents
+		// (each is a full pi startup; parallel mode would fan out unboundedly).
+		// Skip when tools are already fully disabled. Set allowNesting to opt in.
+		if (!allowNesting && !noTools) {
+			args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+		}
 	}
 	if (piArgs && piArgs.length > 0) args.push(...piArgs);
 	if (forkFrom) applyForkArgs(args, forkFrom.sessionFile);
+	for (const ext of toolPolicy?.extensions ?? []) args.push("--extension", ext);
 
 	// Mailbox: child-side companion.ts registers ask_main_agent when the
 	// token env vars are present; it scrubs them so nested spawns don't
 	// inherit this route.
 	let mailToken: string | undefined;
 	let mailCleanup: (() => void) | undefined;
-	if (mailbox && mailbox.hub.ensureServer()) {
+	const allowAdditionsFg = !forkFrom || toolPolicy?.allowAdditions !== false;
+	if (mailbox && mailbox.hub.ensureServer() && allowAdditionsFg) {
 		mailToken = newToken();
 		args.push("--extension", COMPANION_PATH);
 		mailCleanup = mailbox.hub.register(mailToken, (q, respond) => {
@@ -654,6 +725,10 @@ async function runSingleAgent(
 		});
 	}
 	const env: NodeJS.ProcessEnv = { ...process.env };
+	if (forkFrom && !allowNesting) env.PI_SUBAGENT_CHILD = "1";
+	if (guardPolicyJson) env.PI_SUBAGENT_TOOL_POLICY = guardPolicyJson;
+	if (loadoutJson) env.PI_SUBAGENT_TOOL_LOADOUT = loadoutJson;
+	if (forkFrom && !mailToken) args.push("--extension", COMPANION_PATH); // companion carries the policy/loadout even without a mailbox
 	if (mailToken) {
 		env.PI_SUBAGENT_TOKEN = mailToken;
 		env.PI_SUBAGENT_MAIL_SOCK = mailbox!.hub.socketPath!;
@@ -693,8 +768,12 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+		// Fork children: NO persona injection by default (the parent's copied
+		// system prompt is used verbatim — zero drift); the disabled-tool banner
+		// rides in the first prompt instead (new tokens, cache-neutral).
+		const personaText = forkFrom && !toolPolicy?.usePersona ? "" : agent.systemPrompt;
+		if (personaText.trim()) {
+			const tmp = await writePromptToTempFile(agent.name, personaText);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
@@ -759,7 +838,7 @@ Follow these instructions exactly for your response.` : task;
 			else signal.addEventListener("abort", gracefulAbort, { once: true });
 		}
 
-		rpc.prompt(`Task: ${fullTask}`);
+		rpc.prompt(`Task: ${forkFrom ? toolPolicy?.disabledNote ?? "" : ""}${fullTask}`);
 		// RPC children stay warm after settling — one-shot semantics for
 		// foreground: wait for the answer, then terminate the process.
 		await rpc.waitSettled(3600_000, signal);
@@ -853,6 +932,9 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 interface SubagentCallParams {
 	agent?: string | InlineAgentConfig;
 	task?: string;
+	blockTools?: string[];
+	forkToolMode?: "real" | "guard" | "cli";
+	childExtensions?: string[];
 	returnPrompt?: string;
 	tasks?: Array<{ agent: string | InlineAgentConfig; task: string; cwd?: string; piArgs?: string[] }>;
 	chain?: Array<{ agent: string | InlineAgentConfig; task: string; cwd?: string; piArgs?: string[] }>;
@@ -875,6 +957,15 @@ const SubagentParams = Type.Object({
 		InlineAgentSchema,
 	])),
 	task: Type.Optional(Type.String({ description: "Task to delegate. REQUIRED together with `agent` for single mode (pass BOTH, never agent alone)." })),
+	blockTools: Type.Optional(Type.Array(Type.String(), {
+		description: "Extra tools to deny this child (globs, e.g. [\"write\",\"edit\",\"bash\"]). In FORK children this is enforced at RUNTIME keeping the parent's tool declarations (cache-safe); in fresh children via --exclude-tools.",
+	})),
+	forkToolMode: Type.Optional(StringEnum(["real", "guard", "cli"] as const, {
+		description: "Fork children only: 'real' (default, settings-configurable) applies pi's native loadout so removed tools are truly absent from the model's declarations (first fork pays one cache recompute; siblings/rounds share the new lineage). 'guard' keeps the parent's byte-identical declarations (reuses the parent's cached prefix from the first request) and enforces restrictions by blocking calls at runtime ('cli' is a legacy alias for 'real').",
+	})),
+	childExtensions: Type.Optional(Type.Array(Type.String(), {
+		description: "Absolute paths of extra extension files to load into the CHILD (adds tools; cache-safe — additions ride after the copied history). Gated by controls.childExtensions.",
+	})),
 	returnPrompt: Type.Optional(Type.String({ description: "Single mode: instructions controlling exactly what the subagent reports back (keeps your context clean)." })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution. NOTE: runs SEQUENTIALLY unless you also pass concurrency > 1. Mutually exclusive with agent+task and chain." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution, later steps may reference {previous} output. Mutually exclusive with agent+task and tasks." })),
@@ -928,6 +1019,7 @@ export default function (pi: ExtensionAPI) {
 		rpc: RpcSubagent;
 		adoptedJobId?: string;
 		adoptedError?: string;
+		toolNote?: string;
 		/** Resolves the current bg-jobs adoption round (settle or exit). */
 		adoptionResolve?: (code: number | null) => void;
 		startTmp?: { dir: string; filePath: string };
@@ -1208,6 +1300,7 @@ export default function (pi: ExtensionAPI) {
 			parentModel?: string;
 			allowNesting?: boolean;
 			forkFrom?: { sessionFile: string };
+			toolPolicy?: ChildToolPolicy;
 		}
 	): Promise<BgRun> {
 		if (runs.size >= cfg.maxBackground) {
@@ -1228,21 +1321,56 @@ export default function (pi: ExtensionAPI) {
 		const args: string[] = ["--mode", "rpc", "--no-session", "--no-themes", "--no-prompt-templates"];
 		if (agent.model) args.push("--model", agent.model);
 		const noTools = agent.tools && agent.tools.length === 0;
-		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-		else if (noTools) args.push("--no-tools");
-		if (!opts.allowNesting && !noTools) {
-			args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+		const isFork = !!opts.forkFrom;
+		const enforce = opts.toolPolicy?.enforce ?? (isFork ? cfg.forkToolMode : "cli");
+		// Thinking renders into the prompt — forks must mirror the parent's level
+		// or the KV prefix silently diverges.
+		if (isFork) args.push("--thinking", opts.toolPolicy?.thinking ?? "off");
+		let guardPolicyJson: string | undefined;
+		let loadoutJson: string | undefined;
+		let toolNote: string | undefined;
+		if (enforce !== "guard" && isFork) {
+			// "Real" tool changes for forks go through pi's NATIVE loadout (companion
+			// calls setActiveTools at session_start -> transcript-consistent
+			// toolsAdded/toolsRemoved patch). Per pi source, removals re-fold into
+			// params.tools (the request head) and cost the parent KV prefix on this
+			// provider family; additions are cache-safe.
+			const block = [...(opts.toolPolicy?.blockExtra ?? [])];
+			if (!opts.allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+			const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
+			if (allow || block.length > 0) loadoutJson = JSON.stringify({ allow, block });
+			toolNote = "tools changed for real via pi loadout — removals forfeit the parent KV prefix";
+		} else if (enforce !== "guard") {
+			if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+			else if (noTools) args.push("--no-tools");
+			if (!opts.allowNesting && !noTools) {
+				args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+			}
+		} else {
+			// Guard mode (fork, cache-preserving): parent's exact declarations;
+			// restrictions ride as a runtime policy enforced by companion.
+			const block = [...(opts.toolPolicy?.blockExtra ?? [])];
+			if (!opts.allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+			if (noTools) block.push("*");
+			const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
+			if (allow || block.length > 0) guardPolicyJson = JSON.stringify({ allow, block });
 		}
-	if (opts.piArgs && opts.piArgs.length > 0) args.push(...opts.piArgs);
-	if (opts.forkFrom) applyForkArgs(args, opts.forkFrom.sessionFile);
+		if (opts.piArgs && opts.piArgs.length > 0) args.push(...opts.piArgs);
+		if (opts.forkFrom) applyForkArgs(args, opts.forkFrom.sessionFile);
+		for (const ext of opts.toolPolicy?.extensions ?? []) args.push("--extension", ext);
 
 		let startTmp: { dir: string; filePath: string } | undefined;
-		if (agent.systemPrompt.trim()) {
-			startTmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			args.push("--append-system-prompt", startTmp.filePath);
+		{
+			// Fork children: no persona by default (verbatim parent system
+			// prompt, zero drift); disabled-tool banner rides in the first prompt.
+			const sp = isFork && !opts.toolPolicy?.usePersona ? "" : agent.systemPrompt;
+			if (sp.trim()) {
+				startTmp = await writePromptToTempFile(agent.name, sp);
+				args.push("--append-system-prompt", startTmp.filePath);
+			}
 		}
 		const mailboxUp = hub.ensureServer();
-		if (mailboxUp) args.push("--extension", COMPANION_PATH);
+		if (mailboxUp || isFork) args.push("--extension", COMPANION_PATH);
 
 		const fullTask = opts.returnPrompt
 			? `${task}
@@ -1261,7 +1389,10 @@ Follow these instructions exactly for your response.`
 		const logPath = path.join(RUN_LOG_DIR, `${id}.log`);
 		const token = newToken();
 		const env: NodeJS.ProcessEnv = { ...process.env };
-		if (mailboxUp && hub.socketPath) {
+		if (isFork && !opts.allowNesting) env.PI_SUBAGENT_CHILD = "1";
+		if (guardPolicyJson) env.PI_SUBAGENT_TOOL_POLICY = guardPolicyJson;
+		if (loadoutJson) env.PI_SUBAGENT_TOOL_LOADOUT = loadoutJson;
+		if (mailboxUp && hub.socketPath && (!isFork || opts.toolPolicy?.allowAdditions !== false)) {
 			env.PI_SUBAGENT_TOKEN = token;
 			env.PI_SUBAGENT_MAIL_SOCK = hub.socketPath;
 			env.PI_SUBAGENT_NAME = displayName;
@@ -1293,11 +1424,12 @@ Follow these instructions exactly for your response.`
 			responders: new Map(),
 			saveConversation: opts.saveConversation,
 		};
+		run.toolNote = toolNote;
 		runs.set(id, run);
 		registerQuestionRoute(run);
 		bindRunLifecycle(run);
 		openAdoption(run);
-		rpc.prompt(`Task: ${fullTask}`);
+		rpc.prompt(`Task: ${isFork ? opts.toolPolicy?.disabledNote ?? "" : ""}${fullTask}`);
 
 		// Health gates: a child whose model/provider is broken either emits
 		// nothing at all or gets its prompt rejected by pi — report & stop it
@@ -1422,6 +1554,24 @@ Follow these instructions exactly for your response.`
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params: SubagentCallParams, signal, onUpdate, ctx) {
+			// Runtime recursion guard for FORK children: their tool declarations
+			// intentionally match the parent's (cache prefix), so exclusion is
+			// enforced here instead of via --exclude-tools. The operator's
+			// controls.nesting still governs any legitimate nested call.
+			if (process.env.PI_SUBAGENT_CHILD && params.allowNesting !== true) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								"subagent: nested delegation is disabled in forked subagent sessions — do the work yourself " +
+								"(a legitimate nested call requires allowNesting:true AND operator controls.nesting=true).",
+						},
+					],
+					details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [] },
+					isError: true,
+				};
+			}
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
@@ -1552,6 +1702,29 @@ Follow these instructions exactly for your response.`
 				forkFrom = { sessionFile: parentFile };
 			}
 
+			// child tool policy (enforce mode + blocks); computed once per call.
+			const forkEff = effSessionMode === "fork";
+			const blocksForNote = [...cfg.blockTools, ...(params.blockTools ?? [])];
+			if (params.allowNesting !== true) blocksForNote.push("subagent", "search_subagent", "subagent_control");
+			const toolPolicy: ChildToolPolicy = {
+				enforce: forkEff ? params.forkToolMode ?? cfg.forkToolMode : "cli",
+				blockExtra: [...cfg.blockTools, ...(params.blockTools ?? [])],
+				thinking: ctx.thinkingLevel,
+				usePersona: cfg.forkUseAgentPersona,
+				allowAdditions: cfg.childToolAdditions,
+				disabledNote:
+					blocksForNote.length > 0
+						? `[Policy] Disabled for this session — calls will be refused: ${[...new Set(blocksForNote)].join(", ")}. Do the work yourself.\n\n`
+					: "",
+			};
+			if (params.childExtensions && params.childExtensions.length > 0) {
+				if (!ctl.childExtensions) return ctlErr("childExtensions is disabled (controls.childExtensions=false) — loading extra code into children requires operator opt-in");
+				for (const p of params.childExtensions) {
+					if (!fs.existsSync(p)) return { content: [{ type: "text" as const, text: `subagent: childExtension not found: ${p}` }], details: makeDetails("single")([]), isError: true };
+				}
+				toolPolicy.extensions = params.childExtensions;
+			}
+
 			if (modeCount !== 1) {
 				let detail: string;
 				if (hasChain && hasTasks) detail = "you passed both `tasks` (parallel) and `chain` — pick one mode.";
@@ -1601,6 +1774,7 @@ Follow these instructions exactly for your response.`
 							parentModel,
 							allowNesting: params.allowNesting,
 							forkFrom,
+							toolPolicy,
 						});
 						started.push(run);
 					} catch (err) {
@@ -1609,7 +1783,7 @@ Follow these instructions exactly for your response.`
 				}
 				const lines = started.map(
 					(r) =>
-						`• ${r.id}${r.name ? ` "${r.name}"` : ""} [${r.agent}] — ${r.status} · log: ${r.rpc.logPath}${r.adoptedJobId ? ` · bg-jobs: ${r.adoptedJobId}` : ` · not tracked by bg-jobs (${r.adoptedError ?? "bg-jobs not loaded"} — ralph-loop will not wait on it)`}`
+						`• ${r.id}${r.name ? ` "${r.name}"` : ""} [${r.agent}] — ${r.status} · log: ${r.rpc.logPath}${r.adoptedJobId ? ` · bg-jobs: ${r.adoptedJobId}` : ` · not tracked by bg-jobs (${r.adoptedError ?? "bg-jobs not loaded"} — ralph-loop will not wait on it)`}${r.toolNote ? ` · ${r.toolNote}` : ""}`
 				);
 				const text = [
 					started.length > 0
@@ -1703,7 +1877,8 @@ Follow these instructions exactly for your response.`
 						foregroundMail,
 						cfg.controls,
 						cfg.startupTimeoutMs,
-						forkFrom
+						forkFrom,
+						toolPolicy
 					);
 					results.push(result);
 
@@ -1787,7 +1962,8 @@ Follow these instructions exactly for your response.`
 						foregroundMail,
 						cfg.controls,
 						cfg.startupTimeoutMs,
-						forkFrom
+						forkFrom,
+						toolPolicy
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1830,7 +2006,8 @@ Follow these instructions exactly for your response.`
 					foregroundMail,
 					cfg.controls,
 					cfg.startupTimeoutMs,
-					forkFrom
+					forkFrom,
+					toolPolicy
 				);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 				const output = getFinalOutput(result.messages) || "(no output)";

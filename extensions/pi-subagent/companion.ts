@@ -16,8 +16,14 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { matchAny } from "./util.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+
+interface ToolPolicy {
+    allow?: string[];
+    block?: string[];
+}
 
 interface Pending {
     qid: number;
@@ -133,6 +139,77 @@ class MailboxClient {
 }
 
 export default function (pi: ExtensionAPI): void {
+    // ── Tool policy (runs even without a mailbox) ───────────────────────
+    // Two enforcement styles, chosen by the parent's forkToolMode:
+    //  - PI_SUBAGENT_TOOL_POLICY  = "guard": declarations stay identical to the
+    //    parent (KV prefix preserved); denied tools are blocked at call time.
+    //  - PI_SUBAGENT_TOOL_LOADOUT = "real": applies pi's NATIVE loadout —
+    //    setActiveTools() at session_start, before the first prompt — so the
+    //    model's declared tool set truly changes (transcript-consistent
+    //    toolAdded/toolsRemoved patch). Removals may invalidate the cached
+    //    prefix depending on provider; additions are cache-safe.
+    let policy: ToolPolicy | undefined;
+    const policyEnv = process.env.PI_SUBAGENT_TOOL_POLICY;
+    delete process.env.PI_SUBAGENT_TOOL_POLICY;
+    const loadoutEnv = process.env.PI_SUBAGENT_TOOL_LOADOUT;
+    delete process.env.PI_SUBAGENT_TOOL_LOADOUT;
+    if (loadoutEnv) {
+        try {
+            const l = JSON.parse(loadoutEnv) as ToolPolicy;
+            const allow = Array.isArray(l.allow) && l.allow.length > 0 ? l.allow : undefined;
+            const block = Array.isArray(l.block) && l.block.length > 0 ? l.block : undefined;
+            if (allow || block) {
+                pi.on("session_start", async () => {
+                    try {
+                        const current = pi.getActiveTools();
+                        const match = (name: string, pats: string[]) => matchAny(pats, name);
+                        let desired = current;
+                        if (allow) desired = [...new Set([...current, ...allow.filter((a) => !a.includes("*"))])];
+                        if (block) desired = desired.filter((name) => !match(name, block));
+                        if (allow) desired = desired.filter((name) => match(name, allow) || !current.includes(name));
+                        // keep names not previously active but explicitly allowed (e.g. tool_search)
+                        for (const a of allow ?? []) if (!a.includes("*") && !desired.includes(a)) desired.push(a);
+                        pi.setActiveTools(desired);
+                    } catch {
+                        /* loadout is best-effort; guard policy still applies */
+                    }
+                });
+            }
+        } catch {
+            /* malformed → skip */
+        }
+    }
+    if (policyEnv) {
+        try {
+            const p = JSON.parse(policyEnv) as ToolPolicy;
+            if (p && ((Array.isArray(p.allow) && p.allow.length > 0) || (Array.isArray(p.block) && p.block.length > 0)))
+                policy = p;
+        } catch {
+            /* malformed policy → no enforcement (fail open on garbage, the
+               CLI-exact path is the operator's secure option) */
+        }
+    }
+    if (policy) {
+        pi.on("tool_call", async (event) => {
+            const name = (event as { toolName?: string }).toolName ?? "";
+            if (!name) return undefined;
+            if (policy!.allow && policy!.allow.length > 0 && !matchAny(policy!.allow, name)) {
+                return {
+                    block: true,
+                    reason: `tool '${name}' is not available to this subagent (operator tool policy: allow=[${policy!.allow!.join(", ")}]) — continue without it`,
+                };
+            }
+            if (policy!.block && matchAny(policy!.block, name)) {
+                return {
+                    block: true,
+                    reason: `tool '${name}' is not available to this subagent (operator tool policy: denied) — continue without it`,
+                };
+            }
+            return undefined;
+        });
+    }
+
+    // ── Mailbox (ask_main_agent) ────────────────────────────────────────
     const token = process.env.PI_SUBAGENT_TOKEN;
     const sockPath = process.env.PI_SUBAGENT_MAIL_SOCK;
     const parentName = process.env.PI_SUBAGENT_NAME ?? "subagent";

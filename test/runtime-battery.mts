@@ -570,6 +570,28 @@ async function t11() {
     }
     results["T11 fresh child answered"] = freshDone;
     results["T11 fresh did NOT leak token"] = freshDone && !freshLeaked;
+
+    // T12: fork child keeps the parent's tool declarations (cache), so nested
+    // delegation must be blocked by the RUNTIME guard (PI_SUBAGENT_CHILD).
+    const baselineN = trCount();
+    s.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, and ' +
+            'task="Use the subagent tool exactly once (agent=worker, task: say HI). Report that tool result verbatim.". Report its result, then stop.',
+    });
+    const t0n2 = Date.now();
+    let guardSeen = false;
+    while (Date.now() - t0n2 < 180_000) {
+        await sleep(1500);
+        if (trCount() <= baselineN) continue;
+        const trs2 = s.events.filter(
+            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+        );
+        const txt2 = JSON.stringify(trs2[trs2.length - 1]?.message?.content ?? "");
+        if (txt2.includes("nested delegation is disabled") || txt2.includes("not available to this subagent") || /disabled for this session|refus/i.test(txt2)) { guardSeen = true; break; }
+    }
+    results["T12 nested delegation runtime-guarded in fork child"] = guardSeen;
     s.stop();
     await sleep(1000);
 
