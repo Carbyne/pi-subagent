@@ -728,7 +728,10 @@ Follow these instructions exactly for your response.` : task;
 		if (rpc.getLastPromptError())
 			currentResult.errorMessage = `pi rejected the prompt: ${rpc.getLastPromptError()}${currentResult.errorMessage ? ` | ${currentResult.errorMessage}` : ""}`;
 		try {
-			fs.unlinkSync(fgLogPath);
+			// Keep the JSONL when the run came back empty — an unexplained
+			// "(no output)" is precisely when the trace matters.
+			if (rpc.messages.length > 0) fs.unlinkSync(fgLogPath);
+			else currentResult.stderr = (currentResult.stderr ? currentResult.stderr + "\n" : "") + `child log kept: ${fgLogPath}`;
 		} catch {
 			/* keep */
 		}

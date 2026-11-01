@@ -402,7 +402,7 @@ async function t7() {
     s.stop();
     await sleep(1000);
 }
-if (!process.env.SKIP_T12 && !process.env.SKIP_T7) {
+if (!process.env.SKIP_T7) {
     console.log("── T7 broken model e2e (installed)");
     await t7();
     console.log(JSON.stringify(results, null, 0));
@@ -458,12 +458,12 @@ async function t9() {
     s.stop();
     await sleep(1000);
 }
-if (!process.env.SKIP_T12) {
+if (!process.env.SKIP_T8) {
     console.log("── T8 foreground-block e2e (installed)");
     await t8();
     console.log(JSON.stringify(results, null, 0));
 }
-if (!process.env.SKIP_T12 && !process.env.SKIP_T9) {
+if (!process.env.SKIP_T9) {
     console.log("── T9 concurrency-cap announcement (installed)");
     await t9();
     console.log(JSON.stringify(results, null, 0));
@@ -496,7 +496,7 @@ async function t10() {
     s.stop();
     await sleep(1000);
 }
-if (!process.env.SKIP_T12 && !process.env.SKIP_T10) {
+if (!process.env.SKIP_T10) {
     console.log("── T10 foreground Ctrl+C e2e (installed)");
     await t10();
     console.log(JSON.stringify(results, null, 0));
@@ -587,7 +587,7 @@ async function t11() {
     s2.stop();
     await sleep(1000);
 }
-if (!process.env.SKIP_T12 && !process.env.SKIP_T11) {
+if (!process.env.SKIP_T11) {
     console.log("── T11 sessionMode fork/fresh/gate (installed)");
     await t11();
     console.log(JSON.stringify(results, null, 0));
