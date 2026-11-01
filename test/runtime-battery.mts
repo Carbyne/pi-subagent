@@ -382,7 +382,7 @@ async function t7() {
         type: "prompt",
         message:
             "Call the subagent tool exactly once with agent set to the inline object " +
-            "{ name: \"badmodeltest\", model: \"no-such-provider/no-such-model-does-not-exist\" } " +
+            "{ name: \"badmodeltest\", model: \"yoda-kyber/nonexistent-model-xyz-123\" } " +
             "and task \"Reply with exactly OK\", with background: true. Then stop.",
     });
     const deadline = Date.now() + 240_000;
@@ -392,7 +392,7 @@ async function t7() {
         const j = JSON.stringify(s.events);
         if (
             /badmodeltest|no-such-provider/.test(j) &&
-            /NO agent activity|MODEL ERROR|rejected the prompt|exited with code/.test(j)
+            /NO agent activity|MODEL ERROR|rejected the prompt|exited with code|not in the subagent allowlist|blocked by the subagent denylist|subagent model policy|model policy is 'inherit'/.test(j)
         ) {
             reported = true;
             break;
