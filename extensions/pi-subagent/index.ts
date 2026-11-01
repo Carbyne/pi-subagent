@@ -608,9 +608,10 @@ async function runSingleAgent(
 	}
 	agent.model = mpRes.model;
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	// Headless trim: no UI in -p mode, so themes and prompt templates are pure
-	// startup cost with no benefit.
+	const args: string[] = ["--mode", "rpc", "--no-session"];
+	// Headless trim: no UI in rpc mode, so themes and prompt templates are
+	// pure startup cost with no benefit. The task is delivered via the RPC
+	// prompt command (see rpc.prompt below), NOT as a positional argument.
 	args.push("--no-themes", "--no-prompt-templates");
 	if (agent.model) args.push("--model", agent.model);
 	const noTools = agent.tools && agent.tools.length === 0;
