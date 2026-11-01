@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.3
+
+### Added
+
+- **Ctrl+C semantics for subagents.** Foreground runs are now RPC children
+  (same machinery as background mode): interrupting the main session (Ctrl+C)
+  sends pi's own RPC `abort` to the subagent — its current turn stops
+  gracefully instead of being SIGTERM'd mid-stream, and the tool result
+  reports `Agent aborted: Interrupted by user (Ctrl+C)` plus any partial
+  output. Chain/parallel steps preserve partial output on interruption too.
+- **`/subagent-abort [id]`** — user-facing Ctrl+C for background runs
+  (interrupts the current turn; the warm process stays alive for follow-ups).
+  Model-side equivalent already existed: `subagent_control action="abort"`.
+
+### Fixed
+
+- **Stray peek reminders** — reminders re-fired on their original schedule
+  even when nothing was pending: a settled run with no in-flight work and no
+  unanswered question was still nagging every `peekAfter`. Reminders are now
+  armed only for genuinely-running rounds, cancelled on settle (the settle
+  notice is itself the report), re-armed when `send` starts a new round, and
+  self-suppress if the run is idle with no pending question. Background runs
+  no longer arm an initial reminder at all — they announce themselves.
+
 ## 0.3.2
 
 ### Changed

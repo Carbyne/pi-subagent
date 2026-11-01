@@ -142,12 +142,15 @@ Manage them with the `subagent_control` tool:
 | `peek { id, last }` | last few turns (assistant text, tool calls, results) |
 | `send { id, text, deliverAs }` | steer mid-turn or queue a follow-up; wakes an idle run |
 | `reply { id, text }` | answer a pending `ask_main_agent` question — the subagent is blocked until you do |
-| `abort { id }` | interrupt the current turn, keep the process |
+| `abort { id }` | interrupt the current turn, keep the process (Ctrl+C equivalent) |
 | `kill { id }` | terminate |
 | `wait { id, timeout }` | block until settled/exited |
 | `remind { id, after }` | (re)arm the peek reminder, e.g. `after: "5m"` |
 
-Plus `/subagents` for a quick list.
+Plus `/subagents` for a quick list and `/subagent-abort [id]` to Ctrl+C a
+background run's current turn from the keyboard. Foreground runs are interrupted
+by the session's own **Ctrl+C** — it maps to pi's graceful RPC abort (partial
+output preserved), not a process kill.
 
 **pi-bg-jobs integration**: background subagents are adopted as real bg-jobs (via the
 `bg-jobs:adopt` event) — they appear in `bg_jobs` list/kill and the sidebar, and

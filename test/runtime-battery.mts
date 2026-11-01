@@ -468,6 +468,39 @@ if (!process.env.SKIP_T12 && !process.env.SKIP_T9) {
     await t9();
     console.log(JSON.stringify(results, null, 0));
 }
+// ── T10: foreground Ctrl+C maps to graceful RPC abort ───────────────────
+async function t10() {
+    const s = await rpcSession(["--thinking", "off"], "interrupt");
+    s.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", background:false, and ' +
+            'task="Run the bash command: sleep 30 ; then reply SLEEPED-DONE. Then stop.", then stop.',
+    });
+    await sleep(9000); // child should be inside its 30s sleep now
+    const tAbort = Date.now();
+    s.send({ type: "abort" }); // == Ctrl+C on the main session → tool abort signal → RPC abort
+    const deadline = tAbort + 40_000;
+    let reported = false;
+    let dt = -1;
+    while (Date.now() < deadline) {
+        await sleep(1000);
+        if (JSON.stringify(s.events).includes("Interrupted by user")) {
+            reported = true;
+            dt = Date.now() - tAbort;
+            break;
+        }
+    }
+    results["T10 foreground interrupt reported"] = reported;
+    results["T10 interrupt fast (not waiting out the sleep)"] = reported && dt >= 0 && dt < 25_000;
+    s.stop();
+    await sleep(1000);
+}
+if (!process.env.SKIP_T12 && !process.env.SKIP_T10) {
+    console.log("── T10 foreground Ctrl+C e2e (installed)");
+    await t10();
+    console.log(JSON.stringify(results, null, 0));
+}
 const fails = Object.entries(results).filter(([, v]) => v !== true);
 console.log(fails.length === 0 ? "ALL TESTS PASS" : `FAILURES: ${fails.map(([k]) => k).join(", ")}`);
 process.exit(fails.length === 0 ? 0 : 1);

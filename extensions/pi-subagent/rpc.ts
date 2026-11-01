@@ -76,6 +76,8 @@ export class RpcSubagent {
 
     readonly ring: RingEntry[] = [];
     readonly messages: unknown[] = [];
+    private messageCb: (() => void) | undefined;
+    private stderrTail = "";
     readonly usage: RpcUsage = {
         input: 0,
         output: 0,
@@ -146,8 +148,10 @@ export class RpcSubagent {
             for (const line of lines) this.handleEventLine(line);
         });
         this.proc.stderr?.on("data", (data: Buffer) => {
+            const text = data.toString("utf8");
+            this.stderrTail = (this.stderrTail + text).slice(-4000);
             try {
-                appendFileSync(this.logPath, `[stderr] ${data.toString("utf8")}`);
+                appendFileSync(this.logPath, `[stderr] ${text}`);
             } catch {
                 /* log gone */
             }
@@ -224,6 +228,11 @@ export class RpcSubagent {
                 if (!msg) break;
                 this.sawActivity = true;
                 this.messages.push(msg);
+                try {
+                    this.messageCb?.();
+                } catch {
+                    /* listeners must not break the stream */
+                }
                 this.lastActivityAt = Date.now();
                 if (msg.role === "assistant") {
                     this.usage.turns++;
@@ -328,6 +337,16 @@ export class RpcSubagent {
 
     onExit(listener: ExitListener): void {
         void this.exit.then(listener);
+    }
+
+    /** Called after each completed message (streaming progress for foreground runs). */
+    onMessage(cb: () => void): void {
+        this.messageCb = cb;
+    }
+
+    /** Tail of the child's stderr (last 4k) for error reporting. */
+    getStderrTail(): string {
+        return this.stderrTail;
     }
 
     onSettled(listener: SettleListener): () => void {

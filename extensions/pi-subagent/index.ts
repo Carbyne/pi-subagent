@@ -22,7 +22,6 @@
  * output from subagents.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -477,6 +476,7 @@ async function runSingleAgent(
 	allowNesting: boolean | undefined,
 	mailbox?: ForegroundMailbox,
 	controls?: SubagentControls,
+	startupTimeoutMs?: number,
 ): Promise<SingleResult> {
 	const target = resolveAgentTarget(agentName, agents, parentModel);
 	if (!target.ok) {
@@ -608,92 +608,89 @@ async function runSingleAgent(
 IMPORTANT: ${finalReturnPrompt}
 
 Follow these instructions exactly for your response.` : task;
-args.push(`Task: ${fullTask}`);
 		let wasAborted = false;
 
+		// Foreground runs use the SAME rpc child as background mode — so
+		// Ctrl+C in the main session maps to pi's own interrupt (RPC abort):
+		// the subagent stops its current turn gracefully instead of being
+		// SIGTERM'd mid-stream, and partial output is preserved.
 		const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env,
-			});
-			
-			const exitCode = await new Promise<number>((resolve) => {
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+		try {
+			fs.mkdirSync(RUN_LOG_DIR, { recursive: true, mode: 0o700 });
+		} catch {
+			/* existing dir */
+		}
+		const fgLogPath = path.join(
+			RUN_LOG_DIR,
+			`fg-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.log`
+		);
+		const rpc = new RpcSubagent({
+			command: invocation.command,
+			args: invocation.args,
+			cwd: cwd ?? defaultCwd,
+			env,
+			logPath: fgLogPath,
 		});
+		rpc.onMessage(() => emitUpdate());
+		// Broken model/config: pi rejects the prompt before any activity →
+		// fail fast instead of waiting on a child that never produces.
+		rpc.onPromptReject(() => {
+			if (!rpc.hasActivity()) rpc.kill();
+		});
+		const startupGuard = setTimeout(
+			() => {
+				if (!rpc.hasActivity() && rpc.alive()) rpc.kill();
+			},
+			Math.max(15_000, startupTimeoutMs ?? 120_000)
+		);
+		startupGuard.unref();
 
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (signal) {
+			const gracefulAbort = () => {
+				wasAborted = true;
+				void (async () => {
+					try {
+						rpc.abort(); // == Ctrl+C in a normal pi session
+						await rpc.waitSettled(6000);
+					} catch {
+						/* fall through to kill */
+					}
+					rpc.kill();
+				})();
+			};
+			if (signal.aborted) gracefulAbort();
+			else signal.addEventListener("abort", gracefulAbort, { once: true });
+		}
+
+		rpc.prompt(`Task: ${fullTask}`);
+		// RPC children stay warm after settling — one-shot semantics for
+		// foreground: wait for the answer, then terminate the process.
+		await rpc.waitSettled(3600_000, signal);
+		rpc.kill();
+		const exitCode = await rpc.exit;
+		clearTimeout(startupGuard);
+
+		currentResult.messages = rpc.messages as Message[];
+		currentResult.usage = { ...rpc.usage };
+		if (rpc.model) currentResult.model = rpc.model;
+		if (rpc.stopReason) currentResult.stopReason = rpc.stopReason;
+		currentResult.stderr = rpc.getStderrTail();
+		if (rpc.getLastError()) currentResult.errorMessage = rpc.getLastError();
+		if (rpc.getLastPromptError())
+			currentResult.errorMessage = `pi rejected the prompt: ${rpc.getLastPromptError()}${currentResult.errorMessage ? ` | ${currentResult.errorMessage}` : ""}`;
+		try {
+			fs.unlinkSync(fgLogPath);
+		} catch {
+			/* keep */
+		}
+		emitUpdate();
+
+		currentResult.exitCode = wasAborted ? 1 : exitCode ?? 0;
+		if (wasAborted) {
+			currentResult.stopReason = "aborted";
+			currentResult.errorMessage =
+				currentResult.errorMessage || "Interrupted by user (Ctrl+C) — partial output may be available";
+		}
 		// Save conversation summary if requested
 		if (finalSaveConversation) {
 			saveRunSummary(displayName, task, currentResult.messages);
@@ -922,6 +919,11 @@ export default function (pi: ExtensionAPI) {
 			r.peekDueAt = undefined;
 			if (r.status !== "running" && r.status !== "idle") return;
 			const pending = r.questions.find((q) => !q.answered);
+			// Self-limiting: reminders exist to catch a STRAYING worker. A settled
+			// run with no pending question is not waiting on anything — re-firing
+			// would be nagging (the "reminders after nothing to wait for" bug).
+			// Re-arm via subagent_control action="remind" when actually watching.
+			if (r.status === "idle" && !pending) return;
 			const head = `⏰ Subagent peek reminder — ${runLabel(r)}: status ${r.status}, running ${formatAge((r.endAt ?? Date.now()) - r.startedAt)}, ${r.rpc.usage.turns} turns${pending ? " — ⚠ QUESTION PENDING, answer it now (subagent_control action='reply')" : ""}.`;
 			inject(
 				`${head}\n\nMost recent turns:\n${r.rpc.peek(cfg.peekTurns)}\n\nIf off-track: subagent_control action="send" to steer, "kill" to stop, "abort" to interrupt, or "remind" (after=…) to re-arm this check.`,
@@ -992,6 +994,13 @@ export default function (pi: ExtensionAPI) {
 			// Round over: close the adopted bg-job entry so ralph-loop resumes
 			// its follow-ups (the warm RPC process must not count as "busy").
 			r.adoptionResolve?.(0);
+			// The settle notice itself IS the report — cancel any armed peek
+			// reminder so nothing nags while no work is in flight.
+			if (r.peekTimer) {
+				clearTimeout(r.peekTimer);
+				r.peekTimer = undefined;
+				r.peekDueAt = undefined;
+			}
 			scheduleIdleKill(r);
 			const out = clip(r.rpc.finalOutput(), 3000) || "(no text output)";
 			const u = r.rpc.usage;
@@ -1214,7 +1223,6 @@ Follow these instructions exactly for your response.`
 			}
 		});
 
-		if (opts.peekAfterMs > 0) schedulePeek(run, opts.peekAfterMs);
 		return run;
 	}
 
@@ -1566,7 +1574,8 @@ Follow these instructions exactly for your response.`
 						params.saveConversation,
 						params.allowNesting,
 						foregroundMail,
-						cfg.controls
+						cfg.controls,
+						cfg.startupTimeoutMs
 					);
 					results.push(result);
 
@@ -1648,7 +1657,8 @@ Follow these instructions exactly for your response.`
 						params.saveConversation,
 						params.allowNesting,
 						foregroundMail,
-						cfg.controls
+						cfg.controls,
+						cfg.startupTimeoutMs
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1689,7 +1699,8 @@ Follow these instructions exactly for your response.`
 					params.saveConversation,
 					params.allowNesting,
 					foregroundMail,
-					cfg.controls
+					cfg.controls,
+					cfg.startupTimeoutMs
 				);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 				const output = getFinalOutput(result.messages) || "(no output)";
@@ -2125,6 +2136,9 @@ Follow these instructions exactly for your response.`
 						r.idleKillTimer = undefined;
 					}
 					r.status = "running";
+					// Fresh work in flight → re-arm the peek reminder (full window;
+					// the old clock belonged to the previous round).
+					if (cfg.peekAfterMs > 0) schedulePeek(r, cfg.peekAfterMs);
 					openAdoption(r); // new work round → count as a running bg-job again
 					return textResult(`Delivered "${clip(p.text, 60)}" to ${r.id} as ${mode === "steer" ? "steer (before its next LLM call)" : "follow-up (after it stops)"}.`);
 				}
@@ -2181,6 +2195,32 @@ Follow these instructions exactly for your response.`
 	});
 
 	// ── /subagents command ───────────────────────────────────────────
+
+	// User-facing Ctrl+C for a background run: interrupts the current turn,
+	// process stays alive for follow-ups (subagent_control send).
+	pi.registerCommand("subagent-abort", {
+		description:
+			"Interrupt the CURRENT turn of a background subagent (Ctrl+C equivalent; process stays alive for follow-ups). Usage: /subagent-abort [id]",
+		handler: async (args, ctx) => {
+			const r = findRun(args?.trim());
+			if (!r) {
+				const live = [...runs.values()].map((x) => x.id).join(", ") || "none";
+				ctx.ui.notify(`subagent-abort: no such run (running: ${live}). Use /subagents to list.`, "warning");
+				return;
+			}
+			if (!r.rpc.alive()) {
+				ctx.ui.notify(`subagent-abort: ${r.id} already ${r.status}.`, "info");
+				return;
+			}
+			const ok = r.rpc.abort();
+			ctx.ui.notify(
+				ok
+					? `⤴ Interrupted ${r.id} (like Ctrl+C): current turn stopped, process kept for follow-ups via subagent_control send.`
+					: `subagent-abort: failed to deliver abort to ${r.id}.`,
+				"info"
+			);
+		},
+	});
 
 	pi.registerCommand("subagents", {
 		description: "List background subagents (running + recent), with pending-question flags",
