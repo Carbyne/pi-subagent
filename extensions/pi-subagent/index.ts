@@ -66,7 +66,54 @@ const RUN_LOG_DIR = (() => {
  *  user's session list (pi forbids --fork with --no-session) in a swept tmp dir. */
 const FORK_SESSIONS_DIR = path.join(RUN_LOG_DIR, "forked-sessions");
 
-function applyForkArgs(args: string[], sessionFile: string): void {
+/**
+ * Build a SAFE fork source from the parent's live session file.
+ *
+ * The parent forks WHILE its own subagent tool call is in flight: the tail of
+ * the session file is our dangling assistant toolCall (no result yet). A
+ * child forked from that raw file tries to resolve/replay the pending call
+ * (which is excluded in the child) and stalls for minutes. So: copy the file,
+ * strip trailing dangling entries (assistant-with-toolCall / toolResult),
+ * hand pi the clean copy. Everything up to the last settled exchange comes
+ * through intact.
+ */
+function makeForkCopy(parentFile: string): { forkFile: string; dropped: number } {
+	const raw = fs
+		.readFileSync(parentFile, "utf8")
+		.split("\n")
+		.map((l) => l.replace(/\r$/, ""))
+		.filter((l) => l.trim().length > 0);
+	if (raw.length === 0) throw new Error("parent session file is empty — cannot fork");
+	const parsed: Array<{ type?: string; message?: { role?: string; content?: unknown } }> = raw.map((l) => {
+		try {
+			return JSON.parse(l);
+		} catch {
+			return {};
+		}
+	});
+	const isDangling = (e: { type?: string; message?: { role?: string; content?: unknown } }): boolean => {
+		if (e?.type !== "message") return false;
+		const role = e?.message?.role;
+		if (role === "toolResult") return true;
+		if (role === "assistant" && Array.isArray(e?.message?.content))
+			return (e.message.content as Array<{ type?: string }>).some((c) => c?.type === "toolCall");
+		return false;
+	};
+	let end = parsed.length;
+	while (end > 1 && isDangling(parsed[end - 1])) end--;
+	const kept = raw.slice(0, end);
+	try {
+		fs.mkdirSync(FORK_SESSIONS_DIR, { recursive: true, mode: 0o700 });
+	} catch {
+		/* exists */
+	}
+	const forkFile = path.join(FORK_SESSIONS_DIR, `fork-src-${process.pid}-${Date.now()}.jsonl`);
+	fs.writeFileSync(forkFile, kept.join("\n") + "\n", { mode: 0o600 });
+	return { forkFile, dropped: parsed.length - end };
+}
+
+function applyForkArgs(args: string[], parentSessionFile: string): void {
+	const { forkFile } = makeForkCopy(parentSessionFile);
 	const i = args.indexOf("--no-session");
 	if (i >= 0) args.splice(i, 1);
 	try {
@@ -74,7 +121,7 @@ function applyForkArgs(args: string[], sessionFile: string): void {
 	} catch {
 		/* exists */
 	}
-	args.push("--fork", sessionFile, "--session-dir", FORK_SESSIONS_DIR);
+	args.push("--fork", forkFile, "--session-dir", FORK_SESSIONS_DIR);
 }
 
 /** Best-effort: drop forked sessions older than a day. */
