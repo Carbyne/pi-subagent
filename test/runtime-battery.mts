@@ -477,10 +477,26 @@ async function t10() {
             'Call the subagent tool exactly once with agent="worker", background:false, and ' +
             'task="Run the bash command: sleep 30 ; then reply SLEEPED-DONE. Then stop.", then stop.',
     });
-    await sleep(9000); // child should be inside its 30s sleep now
+    // Wait until the parent ACTUALLY calls the subagent tool (event-driven;
+    // a blind fixed sleep raced slow model starts and aborted before the tool
+    // was even invoked).
+    const tCall = Date.now();
+    let called = false;
+    while (Date.now() - tCall < 90_000) {
+        await sleep(1000);
+        if (JSON.stringify(s.events).includes('"name":"subagent"')) { called = true; break; }
+    }
+    if (!called) {
+        results["T10 foreground interrupt reported"] = false;
+        results["T10 interrupt fast (not waiting out the sleep)"] = false;
+        s.stop();
+        await sleep(1000);
+        return;
+    }
+    await sleep(2500); // child now certainly inside its 30s sleep
     const tAbort = Date.now();
     s.send({ type: "abort" }); // == Ctrl+C on the main session → tool abort signal → RPC abort
-    const deadline = tAbort + 40_000;
+    const deadline = tAbort + 60_000;
     let reported = false;
     let dt = -1;
     while (Date.now() < deadline) {
