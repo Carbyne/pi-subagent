@@ -123,6 +123,19 @@ Exactly **one** mode per call:
 
 `background: true` applies to Single and Parallel modes.
 
+### Child session mode: fresh vs fork
+
+`sessionMode: "fork"` starts the child as a **continuation of the current conversation**
+(it receives this session's history via pi's `--fork`) instead of the default `"fresh"`
+empty context — great for “review what we just built” or delegating a step without
+re-explaining it. Forked children persist to a private swept tmp dir, never your session
+list; ephemeral (`--no-session`) parents get a clear error to use `fresh`.
+
+- Default for calls: `"subagent".sessionMode` (settings; default `"fresh"`)
+- Per-call override: `sessionMode: "fresh" | "fork"`
+- Operator restriction: `controls.sessionModes` (e.g. `["fresh"]` forbids context
+  inheritance entirely; `["fork"]` forces context-carrying delegation)
+
 ## Background subagents
 
 `subagent { agent: "worker", task: "…", background: true }` launches the child as a long-lived

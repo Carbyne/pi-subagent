@@ -62,6 +62,39 @@ const RUN_LOG_DIR = (() => {
     return path.join(os.tmpdir(), `pi-subagent-runs-${uid}`);
 })();
 
+/** --fork'ed children must persist a session; keep those files OUT of the
+ *  user's session list (pi forbids --fork with --no-session) in a swept tmp dir. */
+const FORK_SESSIONS_DIR = path.join(RUN_LOG_DIR, "forked-sessions");
+
+function applyForkArgs(args: string[], sessionFile: string): void {
+	const i = args.indexOf("--no-session");
+	if (i >= 0) args.splice(i, 1);
+	try {
+		fs.mkdirSync(FORK_SESSIONS_DIR, { recursive: true, mode: 0o700 });
+	} catch {
+		/* exists */
+	}
+	args.push("--fork", sessionFile, "--session-dir", FORK_SESSIONS_DIR);
+}
+
+/** Best-effort: drop forked sessions older than a day. */
+export function sweepForkedSessions(): void {
+	try {
+		const now = Date.now();
+		for (const name of fs.readdirSync(FORK_SESSIONS_DIR)) {
+			if (!name.endsWith(".jsonl")) continue;
+			const p = path.join(FORK_SESSIONS_DIR, name);
+			try {
+				if (now - fs.statSync(p).mtimeMs > 86_400_000) fs.unlinkSync(p);
+			} catch {
+				/* raced */
+			}
+		}
+	} catch {
+		/* dir absent */
+	}
+}
+
 function getAgentDisplayName(agent: string | InlineAgentConfig): string {
 	return typeof agent === "string" ? agent : (agent as any)?.name ?? "inline";
 }
@@ -340,12 +373,17 @@ interface SubagentControls {
     inlineAgents: boolean; // allow inline {systemPrompt,…} agent objects
     nesting: boolean; // allow allowNesting:true
     piArgs: boolean; // allow custom piArgs passthrough
+    /** Which session modes the model may request. "fork" continues THIS session's
+     *  conversation; "fresh" starts empty. Operators can pin e.g. ["fresh"]. */
+    sessionModes: SessionMode[];
     agentScope?: AgentScope; // clamp requested scope (user ⊆ project ⊆ both)
     allowedAgents?: string[]; // glob allowlist of named agents (default ["*"])
     blockedAgents?: string[]; // glob denylist, applied after allowlist
     maxConcurrency?: number; // clamp for concurrency parameter
     modelPolicy?: ModelPolicy; // child model whitelist/blacklist/inherit
 }
+
+type SessionMode = "fresh" | "fork";
 
 const CONTROLS_DEFAULTS: SubagentControls = {
     background: true,
@@ -355,6 +393,7 @@ const CONTROLS_DEFAULTS: SubagentControls = {
     inlineAgents: true,
     nesting: false,
     piArgs: true,
+    sessionModes: ["fresh", "fork"],
 };
 
 interface SaCfg {
@@ -372,6 +411,8 @@ interface SaCfg {
     peekTurns: number;
     /** Subagent calls default to background:true unless explicitly overridden. */
     defaultBackground: boolean;
+    /** Default child session: "fresh" (empty context) or "fork" (continue this session). */
+    sessionMode: SessionMode;
     /** Kill + report a background run that produced ZERO events within this window
      *  (broken model/auth config would otherwise sit there doing nothing). */
     startupTimeoutMs: number;
@@ -387,6 +428,7 @@ const SA_CFG_DEFAULTS: SaCfg = {
     maxBackground: 8,
     peekTurns: 6,
     defaultBackground: false,
+    sessionMode: "fresh",
     startupTimeoutMs: 120_000,
     controls: { ...CONTROLS_DEFAULTS },
 };
@@ -416,6 +458,7 @@ function loadSubagentSettings(cwd: string): SaCfg {
     if (typeof s.maxBackground === "number" && s.maxBackground > 0) cfg.maxBackground = Math.floor(s.maxBackground);
     if (typeof s.peekTurns === "number" && s.peekTurns > 0) cfg.peekTurns = Math.floor(s.peekTurns);
     if (typeof s.defaultBackground === "boolean") cfg.defaultBackground = s.defaultBackground;
+    if (s.sessionMode === "fresh" || s.sessionMode === "fork") cfg.sessionMode = s.sessionMode;
     try {
         if (s.startupTimeout !== undefined) cfg.startupTimeoutMs = parseDuration(s.startupTimeout);
     } catch {
@@ -426,6 +469,10 @@ function loadSubagentSettings(cwd: string): SaCfg {
         const c: SubagentControls = { ...cfg.controls };
         for (const k of ["background", "foreground", "parallel", "chain", "inlineAgents", "nesting", "piArgs"] as const)
             if (typeof ctl[k] === "boolean") c[k] = ctl[k] as boolean;
+        if (Array.isArray(ctl.sessionModes)) {
+            const sms = (ctl.sessionModes as unknown[]).filter((x): x is SessionMode => x === "fresh" || x === "fork");
+            if (sms.length > 0) c.sessionModes = [...new Set(sms)];
+        }
         if (ctl.agentScope === "user" || ctl.agentScope === "project" || ctl.agentScope === "both") c.agentScope = ctl.agentScope;
         if (Array.isArray(ctl.allowedAgents)) c.allowedAgents = (ctl.allowedAgents as unknown[]).filter((x): x is string => typeof x === "string");
         if (Array.isArray(ctl.blockedAgents)) c.blockedAgents = (ctl.blockedAgents as unknown[]).filter((x): x is string => typeof x === "string");
@@ -477,6 +524,7 @@ async function runSingleAgent(
 	mailbox?: ForegroundMailbox,
 	controls?: SubagentControls,
 	startupTimeoutMs?: number,
+	forkFrom?: { sessionFile: string },
 ): Promise<SingleResult> {
 	const target = resolveAgentTarget(agentName, agents, parentModel);
 	if (!target.ok) {
@@ -531,6 +579,7 @@ async function runSingleAgent(
 		args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
 	}
 	if (piArgs && piArgs.length > 0) args.push(...piArgs);
+	if (forkFrom) applyForkArgs(args, forkFrom.sessionFile);
 
 	// Mailbox: child-side companion.ts registers ask_main_agent when the
 	// token env vars are present; it scrubs them so nested spawns don't
@@ -756,6 +805,7 @@ interface SubagentCallParams {
 	returnPrompt?: string;
 	tasks?: Array<{ agent: string | InlineAgentConfig; task: string; cwd?: string; piArgs?: string[] }>;
 	chain?: Array<{ agent: string | InlineAgentConfig; task: string; cwd?: string; piArgs?: string[] }>;
+	sessionMode?: SessionMode;
 	background?: boolean;
 	name?: string;
 	peekAfter?: string | number;
@@ -777,6 +827,10 @@ const SubagentParams = Type.Object({
 	returnPrompt: Type.Optional(Type.String({ description: "Single mode: instructions controlling exactly what the subagent reports back (keeps your context clean)." })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution. NOTE: runs SEQUENTIALLY unless you also pass concurrency > 1. Mutually exclusive with agent+task and chain." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution, later steps may reference {previous} output. Mutually exclusive with agent+task and tasks." })),
+	sessionMode: Type.Optional(StringEnum(["fresh", "fork"] as const, {
+		description:
+			"Child session mode. 'fresh' (default, follows settings) starts the subagent with an empty context. 'fork' continues THIS session's conversation as the subagent's starting context (a copy of the session file; requires a persisted session). Blocked entirely if not in controls.sessionModes.",
+	})),
 	background: Type.Optional(Type.Boolean({
 		description: "Run detached instead of blocking: applies to single mode and tasks mode; leave unset to follow the 'subagent'.defaultBackground setting. Returns an id immediately; manage with the subagent_control tool (list/peek/send/reply/abort/kill/wait/remind). You will be notified when each run settles and when a subagent asks a question (answer via subagent_control action='reply').",
 	})),
@@ -1102,6 +1156,7 @@ export default function (pi: ExtensionAPI) {
 			peekAfterMs: number;
 			parentModel?: string;
 			allowNesting?: boolean;
+			forkFrom?: { sessionFile: string };
 		}
 	): Promise<BgRun> {
 		if (runs.size >= cfg.maxBackground) {
@@ -1127,7 +1182,8 @@ export default function (pi: ExtensionAPI) {
 		if (!opts.allowNesting && !noTools) {
 			args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
 		}
-		if (opts.piArgs && opts.piArgs.length > 0) args.push(...opts.piArgs);
+	if (opts.piArgs && opts.piArgs.length > 0) args.push(...opts.piArgs);
+	if (opts.forkFrom) applyForkArgs(args, opts.forkFrom.sessionFile);
 
 		let startTmp: { dir: string; filePath: string } | undefined;
 		if (agent.systemPrompt.trim()) {
@@ -1254,6 +1310,7 @@ Follow these instructions exactly for your response.`
 	// ── Session lifecycle ─────────────────────────────────────────────────
 	pi.on("session_start", async (event, ctx) => {
 		cfg = loadSubagentSettings(ctx.cwd);
+		sweepForkedSessions();
 		const reason = (event as { reason?: string })?.reason;
 		if (reason === "reload") {
 			// Adopt live runs from the pre-reload instance: re-stamp them to
@@ -1427,6 +1484,23 @@ Follow these instructions exactly for your response.`
 				}
 			}
 
+			// ── Session mode: fresh (default) vs fork (continue THIS session) ──
+			const effSessionMode: SessionMode = params.sessionMode ?? cfg.sessionMode;
+			if (!ctl.sessionModes.includes(effSessionMode))
+				return ctlErr(
+					`sessionMode '${effSessionMode}' is not permitted — controls.sessionModes=[${ctl.sessionModes.join(", ")}]`
+				);
+			let forkFrom: { sessionFile: string } | undefined;
+			if (effSessionMode === "fork") {
+				const parentFile = (ctx.sessionManager as unknown as { getSessionFile?: () => string | undefined })
+					?.getSessionFile?.();
+				if (!parentFile)
+					return ctlErr(
+						"cannot fork: this session is ephemeral (started with --no-session) — use sessionMode 'fresh'"
+					);
+				forkFrom = { sessionFile: parentFile };
+			}
+
 			if (modeCount !== 1) {
 				let detail: string;
 				if (hasChain && hasTasks) detail = "you passed both `tasks` (parallel) and `chain` — pick one mode.";
@@ -1474,6 +1548,8 @@ Follow these instructions exactly for your response.`
 							returnPrompt: params.returnPrompt,
 							peekAfterMs,
 							parentModel,
+							allowNesting: params.allowNesting,
+							forkFrom,
 						});
 						started.push(run);
 					} catch (err) {
@@ -1575,7 +1651,8 @@ Follow these instructions exactly for your response.`
 						params.allowNesting,
 						foregroundMail,
 						cfg.controls,
-						cfg.startupTimeoutMs
+						cfg.startupTimeoutMs,
+						forkFrom
 					);
 					results.push(result);
 
@@ -1658,7 +1735,8 @@ Follow these instructions exactly for your response.`
 						params.allowNesting,
 						foregroundMail,
 						cfg.controls,
-						cfg.startupTimeoutMs
+						cfg.startupTimeoutMs,
+						forkFrom
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1700,7 +1778,8 @@ Follow these instructions exactly for your response.`
 					params.allowNesting,
 					foregroundMail,
 					cfg.controls,
-					cfg.startupTimeoutMs
+					cfg.startupTimeoutMs,
+					forkFrom
 				);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 				const output = getFinalOutput(result.messages) || "(no output)";

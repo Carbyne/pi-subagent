@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0
+
+### Added
+
+- **`sessionMode: "fresh" | "fork"`** — launch a subagent that CONTINUES the current
+  conversation instead of starting empty. `fork` passes the parent's live session file to
+  the child via pi's `--fork` (the child gets full history as its starting context and
+  answers from it — ideal for “review what we just did”, “continue with fresh eyes”,
+  delegation-with-context without re-explaining). The forked session file is written to a
+  private swept tmp dir (`/tmp/pi-subagent-runs-<uid>/forked-sessions`, entries older than
+  24h removed at session start) — it never pollutes your session list. `--fork` forbids
+  `--no-session`, so ephemeral parents get a clear error telling them to use `fresh`.
+- Setting `"subagent".sessionMode: "fresh" | "fork"` — the default for calls (per-call
+  `sessionMode` param overrides). **Default stays `"fresh"`** (today's behavior).
+- `controls.sessionModes: ["fresh", "fork"]` — operator allowlist of permitted modes
+  (e.g. pin to `["fresh"]` to forbid context inheritance, or `["fork"]` to force
+  context-carrying delegation). Requests outside the list are rejected with a clear error.
+- Applies to foreground, background, parallel and chain children uniformly.
+
 ## 0.3.3
 
 ### Added

@@ -12,10 +12,10 @@ import * as fs from "node:fs";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const results: Record<string, boolean | string> = {};
 
-async function rpcSession(extraArgs: string[], tag: string, cwd = "/home/jakob/git_projects") {
+async function rpcSession(extraArgs: string[], tag: string, cwd = "/home/jakob/git_projects", noSession = true) {
     const log = `/tmp/rt-${tag}.log`;
     fs.writeFileSync(log, "");
-    const child = spawn("pi", ["--mode", "rpc", "--no-session", ...extraArgs], {
+    const child = spawn("pi", ["--mode", "rpc", ...(noSession ? ["--no-session"] : []), ...extraArgs], {
         stdio: ["pipe", "pipe", "pipe"],
         cwd,
     });
@@ -499,6 +499,97 @@ async function t10() {
 if (!process.env.SKIP_T12 && !process.env.SKIP_T10) {
     console.log("── T10 foreground Ctrl+C e2e (installed)");
     await t10();
+    console.log(JSON.stringify(results, null, 0));
+}
+// ── T11: sessionMode fork continues the parent conversation; fresh does not ──
+async function t11() {
+    const parentSessDir = "/tmp/sa-t11-sessions";
+    const cwd = "/tmp/sa-t11-cwd";
+    fs.rmSync(parentSessDir, { recursive: true, force: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    const s = await rpcSession(["--thinking", "off", "--session-dir", parentSessDir], "fork", cwd, false);
+    const settle = async (minCount: number, ms: number) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+            if (s.events.filter((e) => e.type === "agent_settled").length >= minCount) return true;
+            await sleep(1000);
+        }
+        return false;
+    };
+    // seed parent history with a token
+    s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-77-FOKTEST. Reply OK." });
+    if (!(await settle(1, 90_000))) { results["T11 parent seeded"] = false; s.stop(); return; }
+    results["T11 parent seeded"] = true;
+    // fork child must see it
+    s.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, and ' +
+            'task="Reply with the exact token in this conversation that starts with ZEBRA-77. If you cannot see such a token, reply NONE.". Report the tool result verbatim.',
+    });
+    const t0f = Date.now();
+    let forkSaw = false;
+    while (Date.now() - t0f < 150_000) {
+        await sleep(1500);
+        forkSaw = s.events.some(
+            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+                && JSON.stringify(e.message?.content ?? "").includes("ZEBRA-77-FOKTEST")
+        );
+        if (forkSaw) break;
+    }
+    results["T11 fork child saw parent history"] = forkSaw;
+    // fresh child must NOT see it
+    await settle(3, 90_000);
+    s.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", sessionMode="fresh", background:false, and ' +
+            'task="Reply with the exact token in this conversation that starts with ZEBRA-77. If you cannot see such a token, reply NONE.". Report the tool result verbatim.',
+    });
+    const t0n = Date.now();
+    let freshDone = false;
+    let freshLeaked = false;
+    while (Date.now() - t0n < 150_000) {
+        await sleep(1500);
+        const trs = s.events.filter(
+            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+        );
+        const last = trs[trs.length - 1];
+        const txt = JSON.stringify(last?.message?.content ?? "");
+        if (/^"?NONE|NONE/.test(txt) || txt.includes("ZEBRA-77")) {
+            freshDone = true;
+            freshLeaked = txt.includes("ZEBRA-77-FOKTEST");
+            break;
+        }
+    }
+    results["T11 fresh child answered"] = freshDone;
+    results["T11 fresh did NOT leak token"] = freshDone && !freshLeaked;
+    s.stop();
+    await sleep(1000);
+
+    // controls.sessionModes gate
+    const fx = "/tmp/sa-t11-fixture";
+    fs.mkdirSync(`${fx}/.pi`, { recursive: true });
+    fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { controls: { sessionModes: ["fresh"] } } }));
+    const s2 = await rpcSession(["--thinking", "off"], "forkgate", fx);
+    s2.send({
+        type: "prompt",
+        message:
+            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, task="say HI". Report the tool result verbatim.',
+    });
+    const t0g = Date.now();
+    let gated = false;
+    while (Date.now() - t0g < 90_000) {
+        await sleep(1500);
+        if (JSON.stringify(s2.events).includes("sessionModes")) { gated = true; break; }
+    }
+    results["T11 sessionModes gate enforced"] = gated;
+    s2.stop();
+    await sleep(1000);
+}
+if (!process.env.SKIP_T12 && !process.env.SKIP_T11) {
+    console.log("── T11 sessionMode fork/fresh/gate (installed)");
+    await t11();
     console.log(JSON.stringify(results, null, 0));
 }
 const fails = Object.entries(results).filter(([, v]) => v !== true);
