@@ -863,9 +863,11 @@ Follow these instructions exactly for your response.` : task;
 
 		currentResult.exitCode = wasAborted ? 1 : exitCode ?? 0;
 		if (wasAborted) {
+			const childErr = currentResult.errorMessage;
 			currentResult.stopReason = "aborted";
 			currentResult.errorMessage =
-				currentResult.errorMessage || "Interrupted by user (Ctrl+C) — partial output may be available";
+				"Interrupted by user (Ctrl+C) — partial output may be available" +
+				(childErr ? ` (child reported: ${String(childErr).slice(0, 120)})` : "");
 		}
 		// Save conversation summary if requested
 		if (finalSaveConversation) {

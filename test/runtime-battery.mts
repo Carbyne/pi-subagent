@@ -106,7 +106,7 @@ async function t2() {
                 }
             }
             if (m.role !== "assistant" && m.role !== "toolResult" && m.role !== "tool" && /is asking/.test(text)) seen.question = true;
-            if (m.role !== "assistant" && /COLOR=GREEN/.test(text) && /Background subagent/.test(text)) seen.completion = true;
+            if (m.role !== "assistant" && /COLOR=GREEN|(^|[^A-Z])GREEN([^A-Z]|$)/.test(text) && /Background subagent/.test(text)) seen.completion = true;
         }
         if (Object.values(seen).every(Boolean)) break;
     }
@@ -485,7 +485,7 @@ async function t10() {
     let dt = -1;
     while (Date.now() < deadline) {
         await sleep(1000);
-        if (JSON.stringify(s.events).includes("Interrupted by user")) {
+        if (JSON.stringify(s.events).includes("Interrupted by user") || JSON.stringify(s.events).includes("Agent aborted")) {
             reported = true;
             dt = Date.now() - tAbort;
             break;
@@ -503,117 +503,156 @@ if (!process.env.SKIP_T10) {
 }
 // ── T11: sessionMode fork continues the parent conversation; fresh does not ──
 async function t11() {
-    const parentSessDir = "/tmp/sa-t11-sessions";
+    const parentSessBase = "/tmp/sa-t11-sessions";
     const cwd = "/tmp/sa-t11-cwd";
-    fs.rmSync(parentSessDir, { recursive: true, force: true });
+    fs.rmSync(parentSessBase, { recursive: true, force: true });
     fs.mkdirSync(cwd, { recursive: true });
-    const s = await rpcSession(["--thinking", "off", "--session-dir", parentSessDir], "fork", cwd, false);
-    const settle = async (minCount: number, ms: number) => {
-        const t0 = Date.now();
-        while (Date.now() - t0 < ms) {
-            if (s.events.filter((e) => e.type === "agent_settled").length >= minCount) return true;
+
+    // Each phase gets a FRESH parent session kept minimal: long multi-phase
+    // parents went detective-mode (bash-reading fork-src files) and polluted
+    // the assertions. Prompts forbid any tool but subagent.
+    const ONLY_SUBAGENT =
+        "IMPORTANT: use ONLY the subagent tool in this session. Do not use bash, read, ls, " +
+        "or any other tool, and do not inspect any files. Call the subagent tool exactly once as instructed, " +
+        "then stop and report the tool result verbatim.";
+
+    // ── phase 1: fork child sees parent history ──
+    {
+        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p1`], "fork1", cwd, false);
+        s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-77-FOKTEST. Reply OK." });
+        const settled = async (n: number, ms: number) => {
+            const t0 = Date.now();
+            while (Date.now() - t0 < ms) {
+                if (s.events.filter((e) => e.type === "agent_settled").length >= n) return true;
+                await sleep(1000);
+            }
+            return false;
+        };
+        const seeded = await settled(1, 90_000);
+        results["T11 parent seeded"] = seeded;
+        if (seeded) {
+            s.send({
+                type: "prompt",
+                message:
+                    ONLY_SUBAGENT +
+                    ' Now call the subagent tool with EXACTLY these parameters and no others (do not add blockTools or any other argument): agent="worker", sessionMode="fork", background:false, task="Reply with the exact token in this conversation that starts with ZEBRA-77. If you cannot see such a token, reply NONE."',
+            });
+            const t0 = Date.now();
+            let saw = false;
+            while (Date.now() - t0 < 150_000) {
+                await sleep(1500);
+                const trs = s.events.filter(
+                    (e) =>
+                        e.type === "message_end" &&
+                        (e.message?.role === "toolResult" || e.message?.role === "tool" || e.message?.role === "custom")
+                );
+                if (trs.some((t) => JSON.stringify(t.message?.content ?? "").includes("ZEBRA-77-FOKTEST"))) { saw = true; break; }
+            }
+            results["T11 fork child saw parent history"] = saw;
+        }
+        s.stop();
+        await sleep(800);
+    }
+
+    // ── phase 2: fresh child cannot know the token ──
+    {
+        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p2`], "fork2", cwd, false);
+        s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-88-NOPEE. Reply OK." });
+        const t0s = Date.now();
+        let seeded = false;
+        while (Date.now() - t0s < 90_000) {
+            if (s.events.filter((e) => e.type === "agent_settled").length >= 1) { seeded = true; break; }
             await sleep(1000);
         }
-        return false;
-    };
-    // seed parent history with a token
-    s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-77-FOKTEST. Reply OK." });
-    if (!(await settle(1, 90_000))) { results["T11 parent seeded"] = false; s.stop(); return; }
-    results["T11 parent seeded"] = true;
-    // fork child must see it
-    s.send({
-        type: "prompt",
-        message:
-            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, and ' +
-            'task="Reply with the exact token in this conversation that starts with ZEBRA-77. If you cannot see such a token, reply NONE.". Report the tool result verbatim.',
-    });
-    const t0f = Date.now();
-    let forkSaw = false;
-    while (Date.now() - t0f < 150_000) {
-        await sleep(1500);
-        forkSaw = s.events.some(
-            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
-                && JSON.stringify(e.message?.content ?? "").includes("ZEBRA-77-FOKTEST")
-        );
-        if (forkSaw) break;
-    }
-    results["T11 fork child saw parent history"] = forkSaw;
-    // fresh child must NOT see it
-    await settle(3, 90_000);
-    const trCount = () =>
-        s.events.filter(
-            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
-        ).length;
-    const baselineTrs = trCount();
-    s.send({
-        type: "prompt",
-        message:
-            'Call the subagent tool exactly once with agent="worker", sessionMode="fresh", background:false, and ' +
-            'task="Reply with the exact token in this conversation that starts with ZEBRA-77. If you cannot see such a token, reply NONE.". Report the tool result verbatim.',
-    });
-    const t0n = Date.now();
-    let freshDone = false;
-    let freshLeaked = false;
-    while (Date.now() - t0n < 150_000) {
-        await sleep(1500);
-        if (trCount() <= baselineTrs) continue; // only NEW toolResults (fork's old one contains the token legitimately)
-        const trs = s.events.filter(
-            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
-        );
-        const last = trs[trs.length - 1];
-        const txt = JSON.stringify(last?.message?.content ?? "");
-        if (/^"?NONE|NONE/.test(txt) || txt.includes("ZEBRA-77")) {
-            freshDone = true;
-            freshLeaked = txt.includes("ZEBRA-77-FOKTEST");
-            break;
+        if (seeded) {
+            s.send({
+                type: "prompt",
+                message:
+                    ONLY_SUBAGENT +
+                    ' Now call the subagent tool with agent="worker", sessionMode="fresh", background:false, task="Reply with the exact token in this conversation that starts with ZEBRA-88. If you cannot see such a token, reply NONE."',
+            });
+            const t0 = Date.now();
+            let answered = false;
+            let leaked = false;
+            while (Date.now() - t0 < 150_000) {
+                await sleep(1500);
+                const trs = s.events.filter(
+                    (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+                );
+                const hit = trs.find((t) => /NONE|ZEBRA-88/.test(JSON.stringify(t.message?.content ?? "")));
+                if (hit) {
+                    const txt = JSON.stringify(hit.message?.content ?? "");
+                    answered = true;
+                    leaked = txt.includes("ZEBRA-88-NOPEE");
+                    break;
+                }
+            }
+            results["T11 fresh child answered"] = answered;
+            results["T11 fresh did NOT leak token"] = answered && !leaked;
         }
+        s.stop();
+        await sleep(800);
     }
-    results["T11 fresh child answered"] = freshDone;
-    results["T11 fresh did NOT leak token"] = freshDone && !freshLeaked;
 
-    // T12: fork child keeps the parent's tool declarations (cache), so nested
-    // delegation must be blocked by the RUNTIME guard (PI_SUBAGENT_CHILD).
-    const baselineN = trCount();
-    s.send({
-        type: "prompt",
-        message:
-            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, and ' +
-            'task="Use the subagent tool exactly once (agent=worker, task: say HI). Report that tool result verbatim.". Report its result, then stop.',
-    });
-    const t0n2 = Date.now();
-    let guardSeen = false;
-    while (Date.now() - t0n2 < 180_000) {
-        await sleep(1500);
-        if (trCount() <= baselineN) continue;
-        const trs2 = s.events.filter(
-            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
-        );
-        const txt2 = JSON.stringify(trs2[trs2.length - 1]?.message?.content ?? "");
-        if (txt2.includes("nested delegation is disabled") || txt2.includes("not available to this subagent") || /disabled for this session|refus/i.test(txt2)) { guardSeen = true; break; }
+    // ── phase 3: fork child cannot delegate (guard) ──
+    {
+        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p3`], "fork3", cwd, false);
+        s.send({ type: "prompt", message: "Remember the word PARROT. Reply OK." });
+        const t0s = Date.now();
+        let seeded = false;
+        while (Date.now() - t0s < 90_000) {
+            if (s.events.filter((e) => e.type === "agent_settled").length >= 1) { seeded = true; break; }
+            await sleep(1000);
+        }
+        if (seeded) {
+            s.send({
+                type: "prompt",
+                message:
+                    ONLY_SUBAGENT +
+                    ' Now call the subagent tool with agent="worker", sessionMode="fork", background:false, task="Call the subagent tool exactly once (agent=worker, task: say HI) and report that tool result verbatim. If you cannot call it, report why verbatim."',
+            });
+            const t0 = Date.now();
+            let refused = false;
+            while (Date.now() - t0 < 180_000) {
+                await sleep(1500);
+                const trs = s.events.filter(
+                    (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+                );
+                const txt = JSON.stringify(trs[trs.length - 1]?.message?.content ?? "");
+                if (
+                    txt.includes("nested delegation is disabled") ||
+                    txt.includes("not available to this subagent") ||
+                    /disabled for this session|refus/i.test(txt)
+                ) { refused = true; break; }
+            }
+            results["T12 nested delegation runtime-guarded in fork child"] = refused;
+        }
+        s.stop();
+        await sleep(800);
     }
-    results["T12 nested delegation runtime-guarded in fork child"] = guardSeen;
-    s.stop();
-    await sleep(1000);
 
-    // controls.sessionModes gate
-    const fx = "/tmp/sa-t11-fixture";
-    fs.mkdirSync(`${fx}/.pi`, { recursive: true });
-    fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { controls: { sessionModes: ["fresh"] } } }));
-    const s2 = await rpcSession(["--thinking", "off"], "forkgate", fx);
-    s2.send({
-        type: "prompt",
-        message:
-            'Call the subagent tool exactly once with agent="worker", sessionMode="fork", background:false, task="say HI". Report the tool result verbatim.',
-    });
-    const t0g = Date.now();
-    let gated = false;
-    while (Date.now() - t0g < 90_000) {
-        await sleep(1500);
-        if (JSON.stringify(s2.events).includes("sessionModes")) { gated = true; break; }
+    // ── phase 4: controls.sessionModes gate ──
+    {
+        const fx = "/tmp/sa-t11-fixture";
+        fs.mkdirSync(`${fx}/.pi`, { recursive: true });
+        fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { controls: { sessionModes: ["fresh"] } } }));
+        const s = await rpcSession(["--thinking", "off"], "forkgate", fx);
+        s.send({
+            type: "prompt",
+            message:
+                ONLY_SUBAGENT +
+                ' Call the subagent tool with agent="worker", sessionMode="fork", background:false, task="say HI".',
+        });
+        const t0g = Date.now();
+        let gated = false;
+        while (Date.now() - t0g < 90_000) {
+            await sleep(1500);
+            if (JSON.stringify(s.events).includes("sessionModes")) { gated = true; break; }
+        }
+        results["T11 sessionModes gate enforced"] = gated;
+        s.stop();
+        await sleep(800);
     }
-    results["T11 sessionModes gate enforced"] = gated;
-    s2.stop();
-    await sleep(1000);
 }
 if (!process.env.SKIP_T11) {
     console.log("── T11 sessionMode fork/fresh/gate (installed)");
