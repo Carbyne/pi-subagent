@@ -83,7 +83,7 @@ async function t2() {
         message:
             "Call the `subagent` tool exactly ONCE with: agent=\"worker\", background=true, name=\"painter\", " +
             "task=\"Use the ask_main_agent tool to ask the main agent which color to use (offer RED, GREEN, BLUE). " +
-            "When the answer arrives, print exactly COLOR=<answer> as your final reply.\". " +
+            "The answer will contain exactly one of those words — substitute it, e.g. print exactly COLOR=GREEN.\". " +
             "Then reply LAUNCHED <id> and stop. Later, when a message says a subagent is asking, call the " +
             "subagent_control tool with action=\"reply\", its id, and text=\"GREEN\". After the completion notice arrives, reply DONE.",
     });
@@ -540,6 +540,11 @@ async function t11() {
     results["T11 fork child saw parent history"] = forkSaw;
     // fresh child must NOT see it
     await settle(3, 90_000);
+    const trCount = () =>
+        s.events.filter(
+            (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
+        ).length;
+    const baselineTrs = trCount();
     s.send({
         type: "prompt",
         message:
@@ -551,6 +556,7 @@ async function t11() {
     let freshLeaked = false;
     while (Date.now() - t0n < 150_000) {
         await sleep(1500);
+        if (trCount() <= baselineTrs) continue; // only NEW toolResults (fork's old one contains the token legitimately)
         const trs = s.events.filter(
             (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
         );
