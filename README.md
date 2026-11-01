@@ -159,15 +159,54 @@ Settings (`settings.json` → `"subagent"`):
 ```jsonc
 {
   "subagent": {
-    "peekAfter": "10m",     // default reminder delay for background runs (absent/0 = off)
-    "idleTtl": "10m",       // how long a settled background run stays alive for follow-ups
-    "askTimeout": "10m",    // max block time for ask_main_agent
-    "notifyMode": "steer",  // notice delivery: steer | followUp
-    "maxBackground": 8,     // concurrent background subagents
-    "peekTurns": 6          // ring entries shown in reminder peeks
+    "defaultBackground": true, // subagent calls default to background:true (chain stays foreground)
+    "peekAfter": "30m",        // default reminder delay for background runs (absent/0 = off)
+    "idleTtl": "10m",          // how long a settled background run stays alive for follow-ups
+    "askTimeout": "10m",       // max block time for ask_main_agent
+    "startupTimeout": "2m",    // background child with ZERO activity is killed & reported
+    "notifyMode": "steer",     // notice delivery: steer | followUp
+    "maxBackground": 8,        // concurrent background subagents
+    "peekTurns": 6,            // ring entries shown in reminder peeks
+    "controls": {              // ── operator control plane (all optional) ──
+      "background": true,      // false → background mode rejected (even as default)
+      "parallel": true,        // false → tasks[] with >1 item rejected
+      "chain": true,           // false → chain[] rejected
+      "inlineAgents": true,    // false → inline {systemPrompt,…} objects rejected
+      "nesting": false,        // true → allow allowNesting:true
+      "piArgs": true,          // false → piArgs passthrough rejected
+      "agentScope": "user",    // cap: requested scope above this → guidance error
+      "allowedAgents": ["*"],  // globs over NAMED agents (e.g. ["scout", "worker", "review*"])
+      "blockedAgents": ["exec-*"],
+      "maxConcurrency": 4,     // clamp for the concurrency parameter
+      "modelPolicy": {         // what models children may use
+        "mode": "free",        // free | inherit | allowlist | denylist
+        "allow": ["yoda/*"],   // used by mode=allowlist; the CURRENT session model is always allowed
+        "deny": ["*/gpt-*"]    // used by mode=denylist; current model still allowed
+      }
+    }
   }
 }
 ```
+
+`modelPolicy.mode`:
+- **`inherit`** — every child runs on the main agent's current model; agent-file/inline
+  `model:` overrides that deviate are rejected before spawn (clear error, nothing runs)
+- **`allowlist`** — only models matching `allow` (globs: `provider/*`, full `provider/id`, or bare
+  `qwen*` matching the id part). The current main-agent model is implicitly always allowed — add
+  others on top
+- **`denylist`** — everything except matches of `deny`
+
+### Broken child health
+
+A background subagent whose model/provider doesn't work **reports and stops** — it never just
+sits there:
+
+- pi rejects the initial prompt (unknown model etc.) → immediate kill → `🚨 … pi rejected the
+  prompt: …` notice
+- child emits no agent activity within `startupTimeout` → killed → `🚨 … NO agent activity …
+  likely a broken model/provider configuration (model: X)`
+- the final assistant message ends with `stopReason: "error"` → completion notice becomes
+  `⚠️ … ended with a MODEL ERROR: … · model: X — do not reuse it` instead of a false ✅
 
 **Note on `/reload`**: background runs survive a reload (re-adopted by the fresh extension
 instance via shared global state). A session switch (new/resume/fork) kills them.

@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+### Added
+
+- **Default-background mode** — `"subagent".defaultBackground: true` makes
+  subagent calls background unless `background: false` is passed explicitly
+  (chain stays foreground). No more remembering the flag.
+- **Peek reminders default to 30m** (`peekAfter`, like bg-jobs' check cadence);
+  per-call `peekAfter` still overrides.
+- **Operator control plane** — `"subagent".controls` restricts what the main
+  agent may do: `background/parallel/chain/inlineAgents/nesting/piArgs` toggles,
+  `agentScope` cap, `allowedAgents`/`blockedAgents` (globs over named agents),
+  `maxConcurrency` clamp, and **model policy**:
+  `modelPolicy: { "mode": "free"|"inherit"|"allowlist"|"denylist", "allow": [...], "deny": [...] }`
+  — e.g. `"inherit"` forces every child onto the current session model; an
+  allowlist always implicitly includes the current model, matches `provider/*`,
+  full `provider/id`, or bare-id globs ("qwen*"). Violations are reported before
+  spawn, not silently ignored.
+- **Broken-model health** — background runs now fail loudly instead of hanging:
+  - startup watchdog: no agent activity within `startupTimeout` (default 120s)
+    → child killed, `🚨 produced NO agent activity … likely a broken
+    model/provider configuration (model: X)` notification
+  - pi rejecting the prompt (unknown model etc.) → immediate kill +
+    `pi rejected the prompt: …` report
+  - a settle whose final assistant message has `stopReason: "error"` → the
+    completion notice becomes `⚠️ ended with a MODEL ERROR: … · model: X —
+    do not reuse it` instead of a false ✅
+
 ## 0.2.0
 
 ### Added

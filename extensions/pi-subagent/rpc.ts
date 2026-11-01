@@ -67,6 +67,12 @@ export class RpcSubagent {
     private settleListeners = new Set<SettleListener>();
     private lastError: string | undefined;
     private aborted = false;
+    /** True once ANY agent-side event proves the child is doing work
+     *  (agent_start/turn/message/tool). Command responses are NOT activity —
+     *  a child that immediately rejects the prompt has a broken model/config. */
+    private sawActivity = false;
+    private lastPromptError: string | undefined;
+    private promptRejectCb: ((err: string) => void) | undefined;
 
     readonly ring: RingEntry[] = [];
     readonly messages: unknown[] = [];
@@ -180,7 +186,20 @@ export class RpcSubagent {
             return;
         }
         switch (ev?.type) {
+            case "response":
+                // Command result; a rejected prompt (e.g. unknown model,
+                // malformed message) is a hard configuration error.
+                if (ev.success === false && (ev.command === "prompt" || ev.command === undefined)) {
+                    this.lastPromptError = String(ev.error ?? "command rejected");
+                    try {
+                        this.promptRejectCb?.(this.lastPromptError);
+                    } catch {
+                        /* listener errors must not break the stream */
+                    }
+                }
+                break;
             case "agent_start":
+                this.sawActivity = true;
                 this.running = true;
                 this.lastActivityAt = Date.now();
                 break;
@@ -203,6 +222,7 @@ export class RpcSubagent {
             case "message_end": {
                 const msg = ev.message as any;
                 if (!msg) break;
+                this.sawActivity = true;
                 this.messages.push(msg);
                 this.lastActivityAt = Date.now();
                 if (msg.role === "assistant") {
@@ -338,6 +358,20 @@ export class RpcSubagent {
 
     getLastError(): string | undefined {
         return this.lastError;
+    }
+
+    /** Any real agent activity observed (LLM turn started / messages). */
+    hasActivity(): boolean {
+        return this.sawActivity;
+    }
+
+    /** pi's rejection reason for the last rejected command (prompt), if any. */
+    getLastPromptError(): string | undefined {
+        return this.lastPromptError;
+    }
+
+    onPromptReject(cb: (err: string) => void): void {
+        this.promptRejectCb = cb;
     }
 
     /** Format the last `n` ring entries for a peek. */

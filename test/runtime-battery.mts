@@ -339,6 +339,74 @@ if (!process.env.SKIP_T12) {
 console.log("── T3 agent-steer (installed, harness)");
 await t3();
 console.log(JSON.stringify(results, null, 0));
+
+// ── T6: model policy + glob helpers (pure, via jiti import of util.ts) ───────
+async function t6() {
+    const { createJiti } = await import(
+        "/home/jakob/git_projects/pi-subagent/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs"
+    );
+    const DEV = "/home/jakob/git_projects";
+    const jiti = createJiti(import.meta.url, {
+        alias: {
+            "@earendil-works/pi-tui": `${DEV}/pi-agent-steer/node_modules/@earendil-works/pi-tui`,
+            "@earendil-works/pi-coding-agent": `${DEV}/pi-agent-steer/node_modules/@earendil-works/pi-coding-agent`,
+            "typebox": `${DEV}/pi-subagent/node_modules/typebox`,
+        },
+    });
+    const util: any = await jiti.import(`${DEV}/pi-subagent/extensions/pi-subagent/util.ts`);
+    const P = util.applyModelPolicy;
+    results["T6 free passes"] = P("x/y", "a/b", undefined).ok === true && P("x/y", "a/b", { mode: "free" }).ok === true;
+    results["T6 inherit blocks other"] = P("x/y", "a/b", { mode: "inherit" }).ok === false;
+    results["T6 inherit allows same/none"] =
+        P("a/b", "a/b", { mode: "inherit" }).ok === true && P(undefined, "a/b", { mode: "inherit" }).model === "a/b";
+    results["T6 allowlist parent always ok"] =
+        P(undefined, "a/b", { mode: "allowlist" }).model === "a/b" && P("a/b", "a/b", { mode: "allowlist" }).ok === true;
+    results["T6 allowlist globs"] =
+        P("yoda/qwen3", "a/b", { mode: "allowlist", allow: ["yoda/*"] }).ok === true &&
+        P("yoda/qwen3", "a/b", { mode: "allowlist", allow: ["qwen*"] }).ok === true;
+    results["T6 allowlist blocks others"] =
+        P("openai/gpt-9", "a/b", { mode: "allowlist", allow: ["yoda/*"] }).ok === false &&
+        P("openai/gpt-9", "a/b", { mode: "allowlist" }).ok === false;
+    results["T6 denylist blocks/allows"] =
+        P("yoda/bad", "a/b", { mode: "denylist", deny: ["yoda/bad"] }).ok === false &&
+        P("yoda/good", "a/b", { mode: "denylist", deny: ["yoda/bad"] }).ok === true;
+}
+console.log("── T6 model policy units");
+await t6();
+console.log(JSON.stringify(results, null, 0));
+
+// ── T7: broken-model background run must REPORT, not hang forever ───────────
+async function t7() {
+    const s = await rpcSession(["--thinking", "off"], "badmodel");
+    s.send({
+        type: "prompt",
+        message:
+            "Call the subagent tool exactly once with agent set to the inline object " +
+            "{ name: \"badmodeltest\", model: \"no-such-provider/no-such-model-does-not-exist\" } " +
+            "and task \"Reply with exactly OK\", with background: true. Then stop.",
+    });
+    const deadline = Date.now() + 240_000;
+    let reported = false;
+    while (Date.now() < deadline) {
+        await sleep(2000);
+        const j = JSON.stringify(s.events);
+        if (
+            /badmodeltest|no-such-provider/.test(j) &&
+            /NO agent activity|MODEL ERROR|rejected the prompt|exited with code/.test(j)
+        ) {
+            reported = true;
+            break;
+        }
+    }
+    results["T7 broken model reported"] = reported;
+    s.stop();
+    await sleep(1000);
+}
+if (!process.env.SKIP_T12 && !process.env.SKIP_T7) {
+    console.log("── T7 broken model e2e (installed)");
+    await t7();
+    console.log(JSON.stringify(results, null, 0));
+}
 const fails = Object.entries(results).filter(([, v]) => v !== true);
 console.log(fails.length === 0 ? "ALL TESTS PASS" : `FAILURES: ${fails.map(([k]) => k).join(", ")}`);
 process.exit(fails.length === 0 ? 0 : 1);

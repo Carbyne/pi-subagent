@@ -76,3 +76,79 @@ export async function writePromptToTempFile(
     });
     return { dir: tmpDir, filePath };
 }
+
+// ── Control plane: glob matching + model policy (pure, unit-testable) ─────
+
+/** Glob match: * and ? wildcards. A pattern without "/" also matches the
+ *  bare model id part of "provider/id" (so "qwen*" matches "yoda/qwen3"). */
+export function globMatch(pattern: string, value: string): boolean {
+    const rx = (p: string) =>
+        new RegExp("^" + p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+    if (rx(pattern).test(value)) return true;
+    if (!pattern.includes("/")) {
+        const bare = value.includes("/") ? value.split("/").slice(1).join("/") : value;
+        if (rx(pattern).test(bare)) return true;
+    }
+    return false;
+}
+
+export function matchAny(patterns: string[], value: string): boolean {
+    return patterns.some((p) => globMatch(p, value));
+}
+
+export interface ModelPolicy {
+    /** free: anything goes. inherit: children always run the parent model.
+     *  allowlist: only patterns in `allow` (parent model always allowed).
+     *  denylist: anything except patterns in `deny` (parent model always allowed). */
+    mode: "free" | "inherit" | "allowlist" | "denylist";
+    allow?: string[];
+    deny?: string[];
+}
+
+export interface ModelPolicyResult {
+    ok: boolean;
+    model?: string;
+    error?: string;
+}
+
+/** Resolve the model a child may use under the configured policy.
+ *  `requested` is the agent-file/inline model override; parent model is the
+ *  session model. The current main-agent model is ALWAYS permitted (that is
+ *  the baseline the user trusts); policy only restricts deviations. */
+export function applyModelPolicy(
+    requested: string | undefined,
+    parentModel: string | undefined,
+    policy?: ModelPolicy
+): ModelPolicyResult {
+    if (!policy || policy.mode === "free") return { ok: true, model: requested ?? parentModel };
+    if (policy.mode === "inherit") {
+        if (requested && parentModel && requested !== parentModel)
+            return {
+                ok: false,
+                error: `subagent model policy is 'inherit' — the current model (${parentModel}) must be used; agent requested '${requested}'`,
+            };
+        return { ok: true, model: parentModel };
+    }
+    const candidate = requested ?? parentModel;
+    if (!candidate) return { ok: true, model: undefined };
+    if (parentModel && candidate === parentModel) return { ok: true, model: candidate };
+    if (policy.mode === "allowlist") {
+        const list = policy.allow ?? [];
+        return matchAny(list, candidate)
+            ? { ok: true, model: candidate }
+            : {
+                  ok: false,
+                  error: `model '${candidate}' is not in the subagent allowlist [${list.join(", ") || "(empty)"}] — only the current session model${parentModel ? ` (${parentModel})` : ""} and allowlisted models may be used`,
+              };
+    }
+    if (policy.mode === "denylist") {
+        const list = policy.deny ?? [];
+        return matchAny(list, candidate)
+            ? {
+                  ok: false,
+                  error: `model '${candidate}' is blocked by the subagent denylist [${list.join(", ")}]`,
+              }
+            : { ok: true, model: candidate };
+    }
+    return { ok: true, model: candidate };
+}

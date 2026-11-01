@@ -40,7 +40,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { fmtDur, formatAge, getPiInvocation, parseDuration, writePromptToTempFile } from "./util.ts";
+import { fmtDur, formatAge, getPiInvocation, parseDuration, writePromptToTempFile, applyModelPolicy, matchAny, type ModelPolicy } from "./util.ts";
 import { RpcSubagent } from "./rpc.ts";
 import { MailboxHub, type QuestionHandler } from "./mailbox.ts";
 
@@ -326,6 +326,30 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 
 // ── Settings ─────────────────────────────────────────────────────────────────
 
+interface SubagentControls {
+    /** Capabilities the MAIN agent may use — deny to lock the surface down. */
+    background: boolean; // allow background mode
+    parallel: boolean; // allow tasks[] (len > 1)
+    chain: boolean; // allow chain[]
+    inlineAgents: boolean; // allow inline {systemPrompt,…} agent objects
+    nesting: boolean; // allow allowNesting:true
+    piArgs: boolean; // allow custom piArgs passthrough
+    agentScope?: AgentScope; // clamp requested scope (user ⊆ project ⊆ both)
+    allowedAgents?: string[]; // glob allowlist of named agents (default ["*"])
+    blockedAgents?: string[]; // glob denylist, applied after allowlist
+    maxConcurrency?: number; // clamp for concurrency parameter
+    modelPolicy?: ModelPolicy; // child model whitelist/blacklist/inherit
+}
+
+const CONTROLS_DEFAULTS: SubagentControls = {
+    background: true,
+    parallel: true,
+    chain: true,
+    inlineAgents: true,
+    nesting: false,
+    piArgs: true,
+};
+
 interface SaCfg {
     /** Default delay before a "peek at this background subagent" reminder fires. */
     peekAfterMs: number; // 0 = off
@@ -339,15 +363,25 @@ interface SaCfg {
     maxBackground: number;
     /** Ring entries shown in reminder peeks. */
     peekTurns: number;
+    /** Subagent calls default to background:true unless explicitly overridden. */
+    defaultBackground: boolean;
+    /** Kill + report a background run that produced ZERO events within this window
+     *  (broken model/auth config would otherwise sit there doing nothing). */
+    startupTimeoutMs: number;
+    /** Capability/model control plane for what the main agent may do. */
+    controls: SubagentControls;
 }
 
 const SA_CFG_DEFAULTS: SaCfg = {
-    peekAfterMs: 0,
+    peekAfterMs: 30 * 60_000,
     idleTtlMs: 10 * 60_000,
     askTimeoutMs: 10 * 60_000,
     notifyMode: "steer",
     maxBackground: 8,
     peekTurns: 6,
+    defaultBackground: false,
+    startupTimeoutMs: 120_000,
+    controls: { ...CONTROLS_DEFAULTS },
 };
 
 function loadSubagentSettings(cwd: string): SaCfg {
@@ -374,6 +408,31 @@ function loadSubagentSettings(cwd: string): SaCfg {
     if (s.notifyMode === "steer" || s.notifyMode === "followUp") cfg.notifyMode = s.notifyMode;
     if (typeof s.maxBackground === "number" && s.maxBackground > 0) cfg.maxBackground = Math.floor(s.maxBackground);
     if (typeof s.peekTurns === "number" && s.peekTurns > 0) cfg.peekTurns = Math.floor(s.peekTurns);
+    if (typeof s.defaultBackground === "boolean") cfg.defaultBackground = s.defaultBackground;
+    try {
+        if (s.startupTimeout !== undefined) cfg.startupTimeoutMs = parseDuration(s.startupTimeout);
+    } catch {
+        /* keep default */
+    }
+    const ctl = s.controls as Record<string, unknown> | undefined;
+    if (ctl && typeof ctl === "object") {
+        const c: SubagentControls = { ...cfg.controls };
+        for (const k of ["background", "parallel", "chain", "inlineAgents", "nesting", "piArgs"] as const)
+            if (typeof ctl[k] === "boolean") c[k] = ctl[k] as boolean;
+        if (ctl.agentScope === "user" || ctl.agentScope === "project" || ctl.agentScope === "both") c.agentScope = ctl.agentScope;
+        if (Array.isArray(ctl.allowedAgents)) c.allowedAgents = (ctl.allowedAgents as unknown[]).filter((x): x is string => typeof x === "string");
+        if (Array.isArray(ctl.blockedAgents)) c.blockedAgents = (ctl.blockedAgents as unknown[]).filter((x): x is string => typeof x === "string");
+        if (typeof ctl.maxConcurrency === "number" && ctl.maxConcurrency > 0) c.maxConcurrency = Math.floor(ctl.maxConcurrency);
+        const mp = ctl.modelPolicy as Record<string, unknown> | undefined;
+        if (mp && typeof mp === "object" && typeof mp.mode === "string" && ["free", "inherit", "allowlist", "denylist"].includes(mp.mode)) {
+            c.modelPolicy = {
+                mode: mp.mode as ModelPolicy["mode"],
+                allow: Array.isArray(mp.allow) ? (mp.allow as unknown[]).filter((x): x is string => typeof x === "string") : undefined,
+                deny: Array.isArray(mp.deny) ? (mp.deny as unknown[]).filter((x): x is string => typeof x === "string") : undefined,
+            };
+        }
+        cfg.controls = c;
+    }
     return cfg;
 }
 
@@ -409,6 +468,7 @@ async function runSingleAgent(
 	saveConversation: boolean | undefined,
 	allowNesting: boolean | undefined,
 	mailbox?: ForegroundMailbox,
+	controls?: SubagentControls,
 ): Promise<SingleResult> {
 	const target = resolveAgentTarget(agentName, agents, parentModel);
 	if (!target.ok) {
@@ -427,6 +487,23 @@ async function runSingleAgent(
 	const agent = target.agent;
 	const displayName = target.displayName;
 	const parsedInline = target.inlineCfg;
+
+	// Operator model policy (allowlist/denylist/inherit) — reject before spawn.
+	const mpRes = applyModelPolicy(agent.model, parentModel, controls?.modelPolicy);
+	if (!mpRes.ok) {
+		return {
+			agent: displayName,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: mpRes.error ?? "blocked by subagent model policy",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			step,
+			model: agent.model,
+		};
+	}
+	agent.model = mpRes.model;
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	// Headless trim: no UI in -p mode, so themes and prompt templates are pure
@@ -696,7 +773,7 @@ const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution. NOTE: runs SEQUENTIALLY unless you also pass concurrency > 1. Mutually exclusive with agent+task and chain." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution, later steps may reference {previous} output. Mutually exclusive with agent+task and tasks." })),
 	background: Type.Optional(Type.Boolean({
-		description: "Run detached instead of blocking: applies to single mode and tasks mode. Returns an id immediately; manage with the subagent_control tool (list/peek/send/reply/abort/kill/wait/remind). You will be notified when each run settles and when a subagent asks a question (answer via subagent_control action='reply').",
+		description: "Run detached instead of blocking: applies to single mode and tasks mode; leave unset to follow the 'subagent'.defaultBackground setting. Returns an id immediately; manage with the subagent_control tool (list/peek/send/reply/abort/kill/wait/remind). You will be notified when each run settles and when a subagent asks a question (answer via subagent_control action='reply').",
 	})),
 	name: Type.Optional(Type.String({ description: "Human label for background runs (shown in listings and notifications)." })),
 	peekAfter: Type.Optional(Type.Union([Type.String(), Type.Number()], {
@@ -754,6 +831,7 @@ export default function (pi: ExtensionAPI) {
 		peekDueAt?: number;
 		idleKillTimer?: NodeJS.Timeout;
 		wasKilled?: boolean;
+		startupTimedOut?: boolean;
 		saveConversation?: boolean;
 	}
 
@@ -900,13 +978,22 @@ export default function (pi: ExtensionAPI) {
 			scheduleIdleKill(r);
 			const out = clip(r.rpc.finalOutput(), 3000) || "(no text output)";
 			const u = r.rpc.usage;
+			// Final assistant message an error (broken model, provider outage)?
+			// Say so loudly instead of pretending a clean finish.
+			const lastA = [...(r.rpc.messages as Array<{ role?: string; stopReason?: string; errorMessage?: string } | null>)]
+				.reverse()
+				.find((m) => m?.role === "assistant");
+			const errored = !!lastA && lastA.stopReason === "error";
+			const errText = errored ? String(lastA?.errorMessage ?? "model error").split("\n")[0].slice(0, 240) : "";
+			const head = errored
+				? `⚠️ Background subagent ${runLabel(r)} round ${r.settleRounds} ended with a MODEL ERROR: ${errText} · model: ${r.rpc.model ?? "(inherited)"} — if this model is broken, do not reuse it; check the agent's model line or kill the run.`
+				: `✅ Background subagent ${runLabel(r)} finished round ${r.settleRounds}`;
 			inject(
-				`✅ Background subagent ${runLabel(r)} finished round ${r.settleRounds}` +
-					` (${u.turns} turns, ↑${u.input} ↓${u.output}, $${u.cost.toFixed(4)})` +
+				`${head} (${u.turns} turns, ↑${u.input} ↓${u.output}, $${u.cost.toFixed(4)})` +
 					`. Stays alive ${fmtDur(cfg.idleTtlMs)} for follow-ups unless killed.\n\nFinal output:\n${out}\n\n` +
 					`Continue it: subagent_control action="send" · inspect: action="peek" · stop now: action="kill".`,
 				"subagent:finished",
-				{ runId: r.id }
+				{ runId: r.id, errored }
 			);
 		});
 		void r.rpc.exit.then((code) => {
@@ -938,14 +1025,18 @@ export default function (pi: ExtensionAPI) {
 					: "failed";
 			if (r.saveConversation) saveRunSummary(r.agent, r.task, r.rpc.messages as Message[]);
 			if (r.status !== "exited") {
-				// No settle happened (crash/kill) — announce the abnormal end.
+				// No settle happened (crash/kill/config error) — announce the
+				// abnormal end with the most diagnostic detail available.
 				const lastErr = r.rpc.getLastError();
-				const why =
-					r.status === "killed"
-						? "was terminated"
-						: `exited with code ${code}${lastErr ? ` — ${clip(lastErr, 200)}` : ""}`;
+				const promptErr = r.rpc.getLastPromptError();
+				let why: string;
+				if (r.startupTimedOut)
+					why = `produced NO agent activity within ${fmtDur(cfg.startupTimeoutMs)} — likely a broken model/provider configuration (model: ${r.rpc.model ?? "(inherited)"}) — killed`;
+				else if (r.status === "killed") why = "was terminated";
+				else why = `exited with code ${code}`;
+				const extras = [promptErr ? `pi rejected the prompt: ${clip(promptErr, 200)}` : "", lastErr ? clip(lastErr, 200) : ""].filter(Boolean);
 				inject(
-					`Background subagent ${runLabel(r)} ${why} after ${formatAge((r.endAt ?? Date.now()) - r.startedAt)}.\nLast output:\n${clip(r.rpc.finalOutput(), 2000) || "(none)"}`,
+					`🚨 Background subagent ${runLabel(r)} ${why}${extras.length ? ` — ${extras.join(" | ")}` : ""} after ${formatAge((r.endAt ?? Date.now()) - r.startedAt)}.\nLast output:\n${clip(r.rpc.finalOutput(), 2000) || "(none)"}`,
 					"subagent:finished",
 					{ runId: r.id }
 				);
@@ -996,6 +1087,11 @@ export default function (pi: ExtensionAPI) {
 		if (!target.ok) throw new Error(target.error);
 		const agent = target.agent;
 		const displayName = target.displayName;
+
+		// Model policy gate (same rules as foreground).
+		const mpRes = applyModelPolicy(agent.model, opts.parentModel, cfg.controls.modelPolicy);
+		if (!mpRes.ok) throw new Error(`[${displayName}] ${mpRes.error ?? "blocked by subagent model policy"}`);
+		agent.model = mpRes.model;
 
 		const args: string[] = ["--mode", "rpc", "--no-session", "--no-themes", "--no-prompt-templates"];
 		if (agent.model) args.push("--model", agent.model);
@@ -1069,6 +1165,38 @@ Follow these instructions exactly for your response.`
 		bindRunLifecycle(run);
 		openAdoption(run);
 		rpc.prompt(`Task: ${fullTask}`);
+
+		// Health gates: a child whose model/provider is broken either emits
+		// nothing at all or gets its prompt rejected by pi — report & stop it
+		// instead of letting it run forever.
+		if (cfg.startupTimeoutMs > 0) {
+			const wt = setTimeout(() => {
+				if (run.gen !== state.gen) return;
+				if (!rpc.hasActivity() && run.status === "running" && run.settleRounds === 0 && rpc.alive()) {
+					run.startupTimedOut = true;
+					try {
+						rpc.kill();
+					} catch {
+						/* dead already */
+					}
+				}
+			}, cfg.startupTimeoutMs);
+			wt.unref();
+		}
+		rpc.onPromptReject((err) => {
+			if (run.gen !== state.gen) return;
+			// pi rejected the prompt before ANY agent activity → configuration
+			// error (unknown model, bad provider). Fail fast; exit handler reports.
+			if (!rpc.hasActivity()) {
+				try {
+					rpc.kill();
+				} catch {
+					/* dead already */
+				}
+				void err;
+			}
+		});
+
 		if (opts.peekAfterMs > 0) schedulePeek(run, opts.peekAfterMs);
 		return run;
 	}
@@ -1155,7 +1283,7 @@ Follow these instructions exactly for your response.`
 			"Use saveConversation: true to save conversation summary to ~/.pi/subagent-runs/ for later search.",
 			"Use search_subagent tool to find past subagent conversations.",
 			"Use piArgs for extra CLI flags. Use concurrency to control parallelism (default: 1 = sequential).",
-			"BACKGROUND: background:true (single or tasks) detaches the run — returns an id immediately; you are notified when it settles and when the subagent uses its ask_main_agent tool (answer with subagent_control action='reply'). Manage lifecycle with subagent_control: list | peek | send | reply | abort | kill | wait | remind.",
+			"BACKGROUND: detaches the run (single/tasks) — default follows 'subagent'.defaultBackground, override per call with background:true/false. Returns an id immediately; you are notified when it settles and when the subagent uses its ask_main_agent tool (answer with subagent_control action='reply'). Manage lifecycle with subagent_control: list | peek | send | reply | abort | kill | wait | remind.",
 			"Subagents run headless (no themes/prompt-templates) and cannot spawn their own subagents unless allowNesting is set.",
 		].join(" "),
 		parameters: SubagentParams,
@@ -1175,7 +1303,6 @@ Follow these instructions exactly for your response.`
 				params.agent !== null &&
 				(typeof params.agent === "object" ? true : String(params.agent).trim() !== "");
 			const hasTask = typeof params.task === "string" && params.task.trim() !== "";
-			const wantsBackground = params.background === true;
 
 			const makeDetails =
 				(mode: "single" | "parallel" | "chain") =>
@@ -1199,6 +1326,75 @@ Follow these instructions exactly for your response.`
 			}
 			const hasSingle = Boolean(effectiveAgent) && hasTask;
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+
+			// ── Control plane (settings.json "subagent".controls) ────────────────
+			const ctl = cfg.controls;
+			const bgExplicit = params.background === true;
+			let wantsBackground = (params.background === true) || (params.background === undefined && cfg.defaultBackground && !hasChain);
+			const ctlErr = (detail: string) => ({
+				content: [{ type: "text" as const, text: `subagent: ${detail}\n\nAn operator has restricted the subagent tool via settings.json → "subagent".controls.` }],
+				details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+				isError: true,
+			});
+			if (wantsBackground && !ctl.background) {
+				if (bgExplicit) return ctlErr("background mode is disabled (controls.background=false)");
+				wantsBackground = false; // default was only a suggestion
+			}
+			if (hasChain && !ctl.chain) return ctlErr("chain mode is disabled (controls.chain=false)");
+			if (hasTasks && (params.tasks?.length ?? 0) > 1 && !ctl.parallel)
+				return ctlErr("parallel mode (more than one task) is disabled (controls.parallel=false)");
+			const isInlineAgentShape = (a: unknown): boolean =>
+				typeof a === "object" ? a !== null : typeof a === "string" && a.trim().startsWith("{");
+			if (!ctl.inlineAgents) {
+				const anyInline =
+					(effectiveAgent !== undefined && isInlineAgentShape(effectiveAgent)) ||
+					params.tasks?.some((t) => isInlineAgentShape(t.agent)) ||
+					params.chain?.some((s) => isInlineAgentShape(s.agent));
+				if (anyInline) return ctlErr("inline agent definitions are disabled (controls.inlineAgents=false) — use named agents");
+			}
+			if (params.allowNesting === true && !ctl.nesting) return ctlErr("allowNesting is disabled (controls.nesting=false)");
+			if (!ctl.piArgs) {
+				const anyPiArgs =
+					(params.piArgs?.length ?? 0) > 0 ||
+					params.tasks?.some((t) => (t.piArgs?.length ?? 0) > 0) ||
+					params.chain?.some((s) => (s.piArgs?.length ?? 0) > 0);
+				if (anyPiArgs) return ctlErr("piArgs passthrough is disabled (controls.piArgs=false)");
+			}
+			// Named-agent allow/deny lists
+			const gateNamed = (name: string): ReturnType<typeof ctlErr> | undefined => {
+				const allow = ctl.allowedAgents;
+				if (allow && allow.length > 0 && !matchAny(allow, name))
+					return ctlErr(`agent "${name}" is not in the allowedAgents list [${allow.join(", ")}]`);
+				if (ctl.blockedAgents && ctl.blockedAgents.length > 0 && matchAny(ctl.blockedAgents, name))
+					return ctlErr(`agent "${name}" is blocked by blockedAgents [${ctl.blockedAgents.join(", ")}]`);
+				return undefined;
+			};
+			for (const n of [
+				...(effectiveAgent !== undefined && !isInlineAgentShape(effectiveAgent) ? [String(effectiveAgent)] : []),
+				...(params.tasks ?? []).filter((t) => !isInlineAgentShape(t.agent)).map((t) => String(t.agent)),
+				...(params.chain ?? []).filter((s) => !isInlineAgentShape(s.agent)).map((s) => String(s.agent)),
+			]) {
+				const g = gateNamed(n);
+				if (g) return g;
+			}
+			// Agent-scope clamp
+			{
+				const order: Record<AgentScope, number> = { user: 0, project: 1, both: 2 };
+				if (ctl.agentScope && order[agentScope] > order[ctl.agentScope]) {
+					const clamped = ctl.agentScope;
+					const d2 = discoverAgents(ctx.cwd, clamped);
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `subagent: agentScope "${agentScope}" exceeds the operator cap ("${clamped}") — retry with agentScope="${clamped}".`,
+							},
+						],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+			}
 
 			if (modeCount !== 1) {
 				let detail: string;
@@ -1337,7 +1533,8 @@ Follow these instructions exactly for your response.`
 						undefined, // returnPrompt (chain steps keep default contract)
 						params.saveConversation,
 						params.allowNesting,
-						foregroundMail
+						foregroundMail,
+						cfg.controls
 					);
 					results.push(result);
 
@@ -1391,7 +1588,7 @@ Follow these instructions exactly for your response.`
 					}
 				};
 
-				const concurrency = params.concurrency ?? DEFAULT_MAX_CONCURRENCY;
+				const concurrency = Math.min(params.concurrency ?? DEFAULT_MAX_CONCURRENCY, ctl.maxConcurrency ?? Infinity);
 				const results = await mapWithConcurrencyLimit(params.tasks, concurrency, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
@@ -1414,7 +1611,8 @@ Follow these instructions exactly for your response.`
 						undefined, // returnPrompt
 						params.saveConversation,
 						params.allowNesting,
-						foregroundMail
+						foregroundMail,
+						cfg.controls
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1454,7 +1652,8 @@ Follow these instructions exactly for your response.`
 					params.returnPrompt,
 					params.saveConversation,
 					params.allowNesting,
-					foregroundMail
+					foregroundMail,
+					cfg.controls
 				);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 				const output = getFinalOutput(result.messages) || "(no output)";
