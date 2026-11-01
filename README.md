@@ -148,7 +148,7 @@ child's first request. Restrictions are runtime, not declaration:
 | `forkToolMode` | settings / per-call | `"guard"` (default): stable declarations + `tool_call` blocking (cache-safe). `"real"`: pi-native `setActiveTools` loadout — removed tools truly vanish from declarations; removals cost one recompute per fork lineage (siblings/rounds share it). `cli` = legacy alias for real |
 | `blockTools` | settings (globs) / per-call `blockTools` | denied tools; defaults add `subagent, search_subagent, subagent_control` unless `allowNesting` |
 | first-prompt banner | automatic | `[Policy] Disabled for this session: …` prepended to the child's task (new tokens — cache-neutral), so the model knows without trying |
-| `childToolAdditions` | settings (default true) | whether children may declare tools the parent lacks (companion's `ask_main_agent`); false = strict parity |
+| `childExtensions` (per-call param) | fresh children only | extra `--extension` paths for children when they genuinely need tools the parent lacks (gated by `controls.childExtensions`, default off). **Fork children cannot add tools — strict parent parity is always enforced**; a fork that needs extra tools should run as `fresh` |
 | `forkUseAgentPersona` | settings (default false) | append the agent's persona system prompt to forks too (usually undesired — forks continue *you*, not a persona) |
 
 The measured difference on a shared-prefix gateway: `guard` child first request

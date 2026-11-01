@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.4
+
+### Changed
+
+- **Fork children are now strict parent-parity: tool additions are never
+  allowed.** No mailbox credentials reach forks ⇒ the companion registers no
+  tools there (it remains loaded purely as the invisible `tool_call` policy
+  enforcer). `childExtensions` is rejected for `sessionMode:"fork"` with a
+  pointer to `"fresh"` when a child truly needs tools the parent lacks. The
+  `childToolAdditions` setting is removed — one rule, no drift surface.
+- Fresh children are unchanged: companion `ask_main_agent` questions and
+  `childExtensions` (operator-gated) still work — there is no prefix to protect.
+
 ## 0.4.3
 
 ### Changed — fork tool policy now "parent-parity + runtime guard" (the simple, cache-safe design)

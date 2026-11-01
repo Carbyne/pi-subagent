@@ -443,8 +443,6 @@ interface ChildToolPolicy {
 	/** Fork: append the agent persona/system prompt (default false — the
 	 *  parent's copied system prompt is used verbatim, zero drift). */
 	usePersona?: boolean;
-	/** Fork: allow tools the parent does not declare (ask_main_agent etc.). */
-	allowAdditions?: boolean;
 	/** Fork: "[Disabled tools …]" banner auto-prepended to the FIRST prompt
 	 *  (new tokens anyway — cache-neutral) so the model knows without trying. */
 	disabledNote?: string;
@@ -490,9 +488,6 @@ interface SaCfg {
     /** Fork children skip the agent's persona/system prompt entirely (use the
      *  parent's copied system prompt verbatim) unless true — zero drift. */
     forkUseAgentPersona: boolean;
-    /** Allow children to declare tools the parent lacks (currently the
-     *  companion's ask_main_agent). False = strict parent-parity. */
-    childToolAdditions: boolean;
     /** Operator-wide tools denied to ALL children (globs). */
     blockTools: string[];
     /** How long a background child may stay silent before being killed & reported. */
@@ -512,7 +507,6 @@ const SA_CFG_DEFAULTS: SaCfg = {
     sessionMode: "fresh",
     forkToolMode: "guard",
     forkUseAgentPersona: false,
-    childToolAdditions: true,
     blockTools: [],
     startupTimeoutMs: 120_000,
     controls: { ...CONTROLS_DEFAULTS },
@@ -546,7 +540,6 @@ function loadSubagentSettings(cwd: string): SaCfg {
     if (s.sessionMode === "fresh" || s.sessionMode === "fork") cfg.sessionMode = s.sessionMode;
     if (s.forkToolMode === "guard" || s.forkToolMode === "cli" || s.forkToolMode === "real") cfg.forkToolMode = s.forkToolMode;
     if (typeof s.forkUseAgentPersona === "boolean") cfg.forkUseAgentPersona = s.forkUseAgentPersona;
-    if (typeof s.childToolAdditions === "boolean") cfg.childToolAdditions = s.childToolAdditions;
     if (Array.isArray(s.blockTools)) cfg.blockTools = (s.blockTools as unknown[]).filter((x): x is string => typeof x === "string");
     try {
         if (s.startupTimeout !== undefined) cfg.startupTimeoutMs = parseDuration(s.startupTimeout);
@@ -704,7 +697,11 @@ async function runSingleAgent(
 	// inherit this route.
 	let mailToken: string | undefined;
 	let mailCleanup: (() => void) | undefined;
-	const allowAdditionsFg = !forkFrom || toolPolicy?.allowAdditions !== false;
+	// STRICT PARENT PARITY for forks: never pass mailbox credentials → the
+	// companion registers NO tools in fork children (it still enforces the
+	// block-policy as a pure event handler). Additions are a fresh-child
+	// capability; there is no prefix to protect there.
+	const allowAdditionsFg = !forkFrom;
 	if (mailbox && mailbox.hub.ensureServer() && allowAdditionsFg) {
 		mailToken = newToken();
 		args.push("--extension", COMPANION_PATH);
@@ -1392,7 +1389,7 @@ Follow these instructions exactly for your response.`
 		if (isFork && !opts.allowNesting) env.PI_SUBAGENT_CHILD = "1";
 		if (guardPolicyJson) env.PI_SUBAGENT_TOOL_POLICY = guardPolicyJson;
 		if (loadoutJson) env.PI_SUBAGENT_TOOL_LOADOUT = loadoutJson;
-		if (mailboxUp && hub.socketPath && (!isFork || opts.toolPolicy?.allowAdditions !== false)) {
+		if (mailboxUp && hub.socketPath && !isFork) {
 			env.PI_SUBAGENT_TOKEN = token;
 			env.PI_SUBAGENT_MAIL_SOCK = hub.socketPath;
 			env.PI_SUBAGENT_NAME = displayName;
@@ -1711,13 +1708,16 @@ Follow these instructions exactly for your response.`
 				blockExtra: [...cfg.blockTools, ...(params.blockTools ?? [])],
 				thinking: ctx.thinkingLevel,
 				usePersona: cfg.forkUseAgentPersona,
-				allowAdditions: cfg.childToolAdditions,
 				disabledNote:
 					blocksForNote.length > 0
 						? `[Policy] Disabled for this session — calls will be refused: ${[...new Set(blocksForNote)].join(", ")}. Do the work yourself.\n\n`
 					: "",
 			};
 			if (params.childExtensions && params.childExtensions.length > 0) {
+				if (forkEff)
+					return ctlErr(
+						"fork children cannot add tools (strict parent parity) — use sessionMode 'fresh' when a child needs tools the parent lacks"
+					);
 				if (!ctl.childExtensions) return ctlErr("childExtensions is disabled (controls.childExtensions=false) — loading extra code into children requires operator opt-in");
 				for (const p of params.childExtensions) {
 					if (!fs.existsSync(p)) return { content: [{ type: "text" as const, text: `subagent: childExtension not found: ${p}` }], details: makeDetails("single")([]), isError: true };
