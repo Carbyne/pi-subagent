@@ -430,9 +430,42 @@ async function t8() {
     s.stop();
     await sleep(1000);
 }
+// ── T9: concurrency is operator-capped & the clamp is ANNOUNCED ──────────────
+async function t9() {
+    const fx = "/tmp/sa-conc-fixture";
+    fs.mkdirSync(`${fx}/.pi`, { recursive: true });
+    fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { controls: { maxConcurrency: 2 } } }));
+    const s = await rpcSession(["--thinking", "off"], "conc", fx);
+    s.send({
+        type: "prompt",
+        message:
+            "Call the subagent tool exactly once with THREE items in tasks[] " +
+            '[{agent:"worker",task:"Reply with exactly A1"},{agent:"worker",task:"Reply with exactly A2"},' +
+            '{agent:"worker",task:"Reply with exactly A3"}] and concurrency: 5. Then stop.',
+    });
+    const deadline = Date.now() + 300_000;
+    let announced = false;
+    let ran = false;
+    while (Date.now() < deadline) {
+        await sleep(2000);
+        const j = JSON.stringify(s.events);
+        if (/operator cap/i.test(j)) announced = true;
+        if (/A1/.test(j) && /A2/.test(j) && /A3/.test(j)) ran = true;
+        if (announced && ran) break;
+    }
+    results["T9 clamp announced"] = announced;
+    results["T9 all tasks ran (at cap)"] = ran;
+    s.stop();
+    await sleep(1000);
+}
 if (!process.env.SKIP_T12) {
     console.log("── T8 foreground-block e2e (installed)");
     await t8();
+    console.log(JSON.stringify(results, null, 0));
+}
+if (!process.env.SKIP_T12 && !process.env.SKIP_T9) {
+    console.log("── T9 concurrency-cap announcement (installed)");
+    await t9();
     console.log(JSON.stringify(results, null, 0));
 }
 const fails = Object.entries(results).filter(([, v]) => v !== true);

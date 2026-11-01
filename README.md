@@ -118,7 +118,7 @@ Exactly **one** mode per call:
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, task }` | One agent, one task — **both keys required**. A task with no agent runs on the bundled `worker` agent |
-| Parallel | `{ tasks: [...], concurrency }` | ⚠ runs **sequentially** unless `concurrency > 1` (default `1`) — don't assume parallelism from the name |
+| Parallel | `{ tasks: [...], concurrency }` | ⚠ `concurrency` is **advisory only** — the operator cap `controls.maxConcurrency` (default **3**) is the hard, settings-only limit. Over-requests are clamped and **announced in the tool result** so the agent never silently wonders why N ran at a time |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder (foreground only) |
 
 `background: true` applies to Single and Parallel modes.
@@ -178,7 +178,7 @@ Settings (`settings.json` → `"subagent"`):
       "agentScope": "user",    // cap: requested scope above this → guidance error
       "allowedAgents": ["*"],  // globs over NAMED agents (e.g. ["scout", "worker", "review*"])
       "blockedAgents": ["exec-*"],
-      "maxConcurrency": 4,     // clamp for the concurrency parameter
+      "maxConcurrency": 4,     // HARD cap on simultaneous foreground subagents — settings-only; the model's `concurrency` param can request fewer, never more (default cap: 3)
       "modelPolicy": {         // what models children may use
         "mode": "free",        // free | inherit | allowlist | denylist
         "allow": ["yoda/*"],   // used by mode=allowlist; the CURRENT session model is always allowed

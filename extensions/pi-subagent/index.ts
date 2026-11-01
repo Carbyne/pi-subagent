@@ -46,6 +46,12 @@ import { MailboxHub, type QuestionHandler } from "./mailbox.ts";
 
 const DEFAULT_MAX_CONCURRENCY = 1;
 
+/** Operator-authoritative parallel cap. The model's `concurrency` parameter is
+ *  ADVISORY ONLY: it can request fewer, never more than controls.maxConcurrency
+ *  (default 3). Requests above the cap are clamped AND announced in the tool
+ *  result so the agent never silently wonders why only N ran at a time. */
+const OPERATOR_CONCURRENCY_DEFAULT = 3;
+
 const COLLAPSED_ITEM_COUNT = 10;
 
 /** Child-side extension giving subagents the ask_main_agent tool. */
@@ -788,7 +794,7 @@ const SubagentParams = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 	piArgs: Type.Optional(Type.Array(Type.String(), { description: "Extra CLI args to pass to the pi subprocess (single mode only)" })),
-	concurrency: Type.Optional(Type.Integer({ description: "Max SIMULTANEOUS subagents for parallel/chain mode. DEFAULT 1 = sequential (one at a time, despite the 'parallel' name). Pass 2-8 for genuine parallelism.", default: 1 })),
+	concurrency: Type.Optional(Type.Integer({ description: "Advisory only — SIMULTANEOUS subagents. The operator cap (subagent.controls.maxConcurrency, default 3) is the hard limit: higher requests are clamped AND reported, and the cap cannot be raised from a session. Despite the 'parallel' name, tasks run at most this many at a time.", default: 1 })),
 	allowNesting: Type.Optional(Type.Boolean({ description: "Allow subagents to spawn their own subagents. Default: false (the subagent/search_subagent/subagent_control tools are excluded from children to prevent unbounded recursion).", default: false })),
 });
 
@@ -819,6 +825,7 @@ export default function (pi: ExtensionAPI) {
 		status: "running" | "idle" | "exited" | "failed" | "killed";
 		rpc: RpcSubagent;
 		adoptedJobId?: string;
+		adoptedError?: string;
 		/** Resolves the current bg-jobs adoption round (settle or exit). */
 		adoptionResolve?: (code: number | null) => void;
 		startTmp?: { dir: string; filePath: string };
@@ -859,6 +866,13 @@ export default function (pi: ExtensionAPI) {
 	const runs = state.runs;
 	const terminalRuns = state.terminalRuns;
 	let cfg: SaCfg = { ...SA_CFG_DEFAULTS };
+
+	/** Operator-authoritative parallelism (see OPERATOR_CONCURRENCY_DEFAULT). */
+	function effectiveParallelism(requested: number | undefined): { n: number; clampedFrom?: number } {
+		const cap = Math.max(1, Math.floor(cfg.controls.maxConcurrency ?? OPERATOR_CONCURRENCY_DEFAULT));
+		const want = Math.max(1, Math.floor(requested ?? cap));
+		return want > cap ? { n: cap, clampedFrom: want } : { n: want };
+	}
 
 	function clip(s: string, n: number): string {
 		const t = (s ?? "").trim();
@@ -954,6 +968,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		if (result.ok) r.adoptedJobId = result.id;
+		else r.adoptedError = result.error ?? "adoption failed";
 	}
 
 	/** Open a bg-jobs adoption for the current work round (idempotent). */
@@ -1430,6 +1445,14 @@ Follow these instructions exactly for your response.`
 					? params.tasks!.map((t: { agent: string | InlineAgentConfig; task: string; cwd?: string; piArgs?: string[] }) => ({ agent: t.agent, task: t.task, cwd: t.cwd, piArgs: t.piArgs }))
 					: [{ agent: effectiveAgent!, task: params.task!, cwd: params.cwd, piArgs: params.piArgs }];
 				const peekAfterMs = params.peekAfter !== undefined ? parseDuration(params.peekAfter) : cfg.peekAfterMs;
+				// Background mode launches immediately; the effective concurrency cap
+				// is still announced so an over-requesting model learns the rule now,
+				// not after watching N-at-a-time behaviour.
+				const bgPar = effectiveParallelism(hasTasks ? params.concurrency : 1);
+				const bgClampNote =
+					bgPar.clampedFrom !== undefined
+						? `\nNOTE: requested concurrency=${bgPar.clampedFrom} exceeds the operator cap (${bgPar.n}); background launches proceed immediately but foreground parallelism is capped — maxConcurrency is settings-only.\n`
+						: "";
 				const started: BgRun[] = [];
 				const errors: string[] = [];
 				for (let i = 0; i < items.length; i++) {
@@ -1451,12 +1474,13 @@ Follow these instructions exactly for your response.`
 				}
 				const lines = started.map(
 					(r) =>
-						`• ${r.id}${r.name ? ` "${r.name}"` : ""} [${r.agent}] — ${r.status} · log: ${r.rpc.logPath}${r.adoptedJobId ? ` · bg-jobs: ${r.adoptedJobId}` : " (bg-jobs not loaded — tracked internally)"}`
+						`• ${r.id}${r.name ? ` "${r.name}"` : ""} [${r.agent}] — ${r.status} · log: ${r.rpc.logPath}${r.adoptedJobId ? ` · bg-jobs: ${r.adoptedJobId}` : ` · not tracked by bg-jobs (${r.adoptedError ?? "bg-jobs not loaded"} — ralph-loop will not wait on it)`}`
 				);
 				const text = [
 					started.length > 0
 						? `Started ${started.length} background subagent(s). You are NOT blocked — keep working. You'll be notified when each settles and when one asks a question (answer with subagent_control action="reply").`
 						: "",
+					bgClampNote,
 					...lines,
 					errors.length > 0 ? `Errors: ${errors.join("; ")}` : "",
 					`Manage: subagent_control { action: "list" | "peek" | "send" | "reply" | "abort" | "kill" | "wait" | "remind", id }`,
@@ -1596,8 +1620,12 @@ Follow these instructions exactly for your response.`
 					}
 				};
 
-				const concurrency = Math.min(params.concurrency ?? DEFAULT_MAX_CONCURRENCY, ctl.maxConcurrency ?? Infinity);
-				const results = await mapWithConcurrencyLimit(params.tasks, concurrency, async (t, index) => {
+				const concurrency = effectiveParallelism(params.concurrency);
+				const clampNote =
+					concurrency.clampedFrom !== undefined
+						? `NOTE: you requested concurrency=${concurrency.clampedFrom}, but the operator cap (subagent.controls.maxConcurrency) is ${concurrency.n} — ran ${concurrency.n} at a time. This limit is settings-only and cannot be changed from a session.\n\n`
+						: "";
+				const results = await mapWithConcurrencyLimit(params.tasks, concurrency.n, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
@@ -1637,7 +1665,7 @@ Follow these instructions exactly for your response.`
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+							text: `${clampNote}Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
 						},
 					],
 					details: makeDetails("parallel")(results),

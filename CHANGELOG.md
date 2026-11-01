@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.2
+
+### Changed
+
+- **Parallelism is now operator-controlled, not model-controlled.** The `concurrency`
+  parameter is advisory: effective parallelism is `min(requested, controls.maxConcurrency)`
+  with a default operator cap of **3** (`OPERATOR_CONCURRENCY_DEFAULT`). A model can request
+  fewer, never more, and the cap cannot be raised from a session.
+- **Silent downgrades are gone**: when a request is clamped, the tool result leads with
+  `NOTE: you requested concurrency=6, but the operator cap … is 3 — ran 3 at a time`
+  (same announcement on background launches). Previously agents had to infer the cap from
+  observed behaviour.
+- Background runs declined by bg-jobs (e.g. its own `maxConcurrent` reached) are reported
+  per-run as `not tracked by bg-jobs (<reason> — ralph-loop will not wait on it)` instead
+  of a generic 'not loaded' note.
+
 ## 0.3.1
 
 ### Added
