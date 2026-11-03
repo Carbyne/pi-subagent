@@ -575,8 +575,14 @@ async function t11() {
 
     // ── phase 2: fresh child cannot know the token ──
     {
-        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p2`], "fork2", cwd, false);
-        s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-88-NOPEE. Reply OK." });
+        // Dedicated EMPTY cwd + no-tools instructions: a previous run's parent
+        // wrote the token into a shared-dir file via bash and the fresh child
+        // cat'd it (test pollution, not an isolation leak).
+        const cwd2 = `${cwd}-p2`;
+        fs.rmSync(cwd2, { recursive: true, force: true });
+        fs.mkdirSync(cwd2, { recursive: true });
+        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p2`], "fork2", cwd2, false);
+        s.send({ type: "prompt", message: "Remember this: the secret token is ZEBRA-88-NOPEE. Reply exactly OK. Do NOT use any tools and do NOT write any files." });
         const t0s = Date.now();
         let seeded = false;
         while (Date.now() - t0s < 90_000) {
@@ -588,7 +594,7 @@ async function t11() {
                 type: "prompt",
                 message:
                     ONLY_SUBAGENT +
-                    ' Now call the subagent tool with agent="worker", sessionMode="fresh", background:false, task="Reply with the exact token in this conversation that starts with ZEBRA-88. If you cannot see such a token, reply NONE."',
+                    ' Now call the subagent tool with agent="worker", sessionMode="fresh", background:false, task="Without using any tools, reply with the exact token in this conversation that starts with ZEBRA-88. If you cannot see such a token, reply NONE."',
             });
             const t0 = Date.now();
             let answered = false;
