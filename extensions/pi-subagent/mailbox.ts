@@ -39,9 +39,21 @@ export class MailboxHub {
     private routes = new Map<string, Route>();
     private sockPath: string | null = null;
     private dir: string;
+    /** Set when listen fails (EACCES etc.). net.Server reports listen errors
+     *  ASYNC via 'error' events — without a listener that becomes an
+     *  uncaughtException and kills pi (observed on Windows). */
+    private down = false;
 
     constructor() {
-        const uid = (process as unknown as { uid?: number }).uid ?? os.userInfo().uid ?? 0;
+        const rawUid = (process as unknown as { uid?: number }).uid;
+        const infoUid = (() => {
+            try {
+                return os.userInfo().uid;
+            } catch {
+                return undefined;
+            }
+        })();
+        const uid = typeof rawUid === "number" && rawUid >= 0 ? rawUid : typeof infoUid === "number" && infoUid >= 0 ? infoUid : "shared";
         this.dir = path.join(os.tmpdir(), `pi-subagent-mail-${uid}`);
     }
 
@@ -50,47 +62,74 @@ export class MailboxHub {
     }
 
     /** Create the listening socket lazily. Returns false when unavailable
-     *  (no AF_UNIX support, permissions) — callers degrade gracefully. */
+     *  (no AF_UNIX support, permissions, Windows pipe failure) — all callers
+     *  MUST degrade gracefully (subagent keeps working, just without the
+     *  ask_main_agent mailbox). Never throws, never leaves an unhandled
+     *  server 'error' event. */
     ensureServer(): boolean {
-        if (this.server) return true;
+        if (this.server && this.sockPath) return true;
+        if (this.down) return false;
+        const isWin = process.platform === "win32";
+        // Windows: filesystem-path sockets are not real AF_UNIX — use a proper
+        // named pipe identity instead (\\.\pipe\name). POSIX: unix socket file.
+        let sockPath: string;
         try {
-            fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-            // Stale sockets from crashed parents would block listen(); sweep
-            // anything older than a day (own uid dir, safe to unlink).
-            try {
-                const now = Date.now();
-                for (const name of fs.readdirSync(this.dir)) {
-                    if (!name.endsWith(".sock")) continue;
-                    const p = path.join(this.dir, name);
-                    try {
-                        const st = fs.statSync(p);
-                        if (now - st.mtimeMs > 86_400_000) fs.unlinkSync(p);
-                    } catch {
-                        /* raced */
+            if (isWin) {
+                sockPath = `\\\\.\\pipe\\pi-subagent-mail-${process.pid}`;
+            } else {
+                fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+                // Stale sockets from crashed parents would block listen(); sweep
+                // anything older than a day (own uid dir, safe to unlink).
+                try {
+                    const now = Date.now();
+                    for (const name of fs.readdirSync(this.dir)) {
+                        if (!name.endsWith(".sock")) continue;
+                        const p = path.join(this.dir, name);
+                        try {
+                            const st = fs.statSync(p);
+                            if (now - st.mtimeMs > 86_400_000) fs.unlinkSync(p);
+                        } catch {
+                            /* raced */
+                        }
                     }
+                } catch {
+                    /* sweep is best-effort */
                 }
-            } catch {
-                /* sweep is best-effort */
-            }
-            const sockPath = path.join(this.dir, `parent-${process.pid}.sock`);
-            try {
-                fs.unlinkSync(sockPath);
-            } catch {
-                /* not present */
+                sockPath = path.join(this.dir, `parent-${process.pid}.sock`);
+                try {
+                    fs.unlinkSync(sockPath);
+                } catch {
+                    /* not present */
+                }
             }
             const server = net.createServer((socket) => this.onConnection(socket));
+            // THE crash fix: listen() failures (EACCES…) surface as async
+            // 'error' events; with no listener that kills the host process.
+            server.on("error", () => {
+                this.down = true;
+                try {
+                    server.close();
+                } catch {
+                    /* ignore */
+                }
+                this.server = null;
+                this.sockPath = null;
+            });
             server.listen(sockPath);
-            try {
-                fs.chmodSync(sockPath, 0o600);
-            } catch {
-                /* best-effort */
-            }
             this.server = server;
             this.sockPath = sockPath;
+            if (!isWin) {
+                try {
+                    fs.chmodSync(sockPath, 0o600);
+                } catch {
+                    /* best-effort */
+                }
+            }
             return true;
         } catch {
             this.server = null;
             this.sockPath = null;
+            this.down = true;
             return false;
         }
     }

@@ -224,7 +224,10 @@ export default function (pi: ExtensionAPI): void {
     delete process.env.PI_SUBAGENT_ASK_TIMEOUT_MS;
 
     if (!token || !sockPath) return; // not spawned by pi-subagent → stay silent
-    if (!fs.existsSync(sockPath)) return; // parent's hub is gone
+    // On Windows the parent uses a named pipe (\\.\pipe\…) — stat-based
+    // existence checks are unreliable there; attempt the connection and let
+    // MailboxClient's error handling degrade gracefully instead.
+    if (process.platform !== "win32" && !fs.existsSync(sockPath)) return; // parent's hub is gone
 
     const client = new MailboxClient(sockPath, token);
 

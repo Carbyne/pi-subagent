@@ -22,8 +22,11 @@ cannot pollute yours. Supports single, parallel, and chained execution.
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono) ≥ 0.84
-- Linux or macOS. Each subagent is spawned as a POSIX child process and killed via
-  signals; **Windows is not supported.**
+- Linux / macOS recommended. Each subagent is spawned as a child process and killed via
+  POSIX signals; **Windows is best-effort** — process-group kills degrade to direct
+  termination and the parent↔child mailbox uses named pipes
+  (`\\.\pipe\pi-subagent-mail-<pid>`). All mailbox/socket failures degrade gracefully
+  (subagents keep working, just without `ask_main_agent`) and never crash the host.
 
 ## Installation
 

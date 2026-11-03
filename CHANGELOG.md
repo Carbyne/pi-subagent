@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.5
+
+### Fixed
+
+- **Windows host crash (`uncaughtException: listen EACCES …parent-<pid>.sock`)
+  taking all of pi down.** Three compounding bugs in the mailbox hub:
+  1. `net.Server` reports `listen()` failures asynchronously via `'error'`
+     events — the existing try/catch could never see them and with no error
+     listener the EACCES escaped as an uncaughtException. Server now gets an
+     `'error'` listener that marks the hub down and degrades gracefully.
+  2. Filesystem-path “unix sockets” (`%TEMP%\…\.sock`) are not valid on
+     Windows — the hub now uses a proper named pipe
+     (`\\.\pipe\pi-subagent-mail-<pid>`) on win32; the companion skips
+     unreliable pipe existence probes there and degrades via connect errors.
+  3. `os.userInfo().uid` is `-1` on Windows → junk dir name
+     (`pi-subagent-mail--1`); uid resolution is now validated with a
+     `shared` fallback.
+  Effect: mailbox unavailable ⇒ subagents still run, `ask_main_agent` simply
+  isn’t registered — the host never dies. Windows is now best-effort supported
+  (README updated); POSIX signal-based killing still degrades to direct kill.
+
 ## 0.4.4
 
 ### Changed
