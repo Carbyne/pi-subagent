@@ -470,7 +470,10 @@ if (!process.env.SKIP_T9) {
 }
 // ── T10: foreground Ctrl+C maps to graceful RPC abort ───────────────────
 async function t10() {
-    const s = await rpcSession(["--thinking", "off"], "interrupt");
+    const fx = "/tmp/sa-t10-fixture";
+    fs.mkdirSync(`${fx}/.pi`, { recursive: true });
+    fs.writeFileSync(`${fx}/.pi/settings.json`, JSON.stringify({ subagent: { defaultBackground: false } }));
+    const s = await rpcSession(["--thinking", "off"], "interrupt", fx);
     s.send({
         type: "prompt",
         message:
@@ -612,7 +615,10 @@ async function t11() {
 
     // ── phase 3: fork child cannot delegate (guard) ──
     {
-        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p3`], "fork3", cwd, false);
+        const fx3 = "/tmp/sa-t12-fixture";
+        fs.mkdirSync(`${fx3}/.pi`, { recursive: true });
+        fs.writeFileSync(`${fx3}/.pi/settings.json`, JSON.stringify({ subagent: { defaultBackground: false } }));
+        const s = await rpcSession(["--thinking", "off", "--session-dir", `${parentSessBase}/p3`], "fork3", fx3, false);
         s.send({ type: "prompt", message: "Remember the word PARROT. Reply OK." });
         const t0s = Date.now();
         let seeded = false;
@@ -627,20 +633,32 @@ async function t11() {
                     ONLY_SUBAGENT +
                     ' Now call the subagent tool with agent="worker", sessionMode="fork", background:false, task="Call the subagent tool exactly once (agent=worker, task: say HI) and report that tool result verbatim. If you cannot call it, report why verbatim."',
             });
-            const t0 = Date.now();
-            let refused = false;
-            while (Date.now() - t0 < 180_000) {
-                await sleep(1500);
-                // Scan ALL parent events: the refusal text arrives either in the
-                // toolResult (obedient parent) or inside the background settle
-                // notification (parent ignored background:false) — the strings
-                // below are unique to a genuine block.
+            const scanBlock = () => {
                 const j = JSON.stringify(s.events);
-                if (
+                return (
                     j.includes("nested delegation is disabled") ||
                     j.includes("not available to this subagent") ||
                     j.includes("operator tool policy")
-                ) { refused = true; break; }
+                );
+            };
+            const waitBlock = async (ms: number) => {
+                const t0 = Date.now();
+                while (Date.now() - t0 < ms) {
+                    if (scanBlock()) return true;
+                    await sleep(1500);
+                }
+                return scanBlock();
+            };
+            let refused = await waitBlock(90_000);
+            if (!refused) {
+                // Nudge once: small models sometimes paraphrase the policy
+                // banner from their prompt instead of attempting the call.
+                s.send({
+                    type: "prompt",
+                    message:
+                        'Your previous attempt did not produce a tool result. Call the subagent tool NOW (agent="worker", task="say HI") and report the RAW tool result verbatim. Do not summarize or quote your instructions.',
+                });
+                refused = await waitBlock(120_000);
             }
             results["T12 nested delegation runtime-guarded in fork child"] = refused;
         }
