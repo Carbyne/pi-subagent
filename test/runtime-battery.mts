@@ -631,14 +631,15 @@ async function t11() {
             let refused = false;
             while (Date.now() - t0 < 180_000) {
                 await sleep(1500);
-                const trs = s.events.filter(
-                    (e) => e.type === "message_end" && (e.message?.role === "toolResult" || e.message?.role === "tool")
-                );
-                const txt = JSON.stringify(trs[trs.length - 1]?.message?.content ?? "");
+                // Scan ALL parent events: the refusal text arrives either in the
+                // toolResult (obedient parent) or inside the background settle
+                // notification (parent ignored background:false) — the strings
+                // below are unique to a genuine block.
+                const j = JSON.stringify(s.events);
                 if (
-                    txt.includes("nested delegation is disabled") ||
-                    txt.includes("not available to this subagent") ||
-                    /disabled for this session|refus/i.test(txt)
+                    j.includes("nested delegation is disabled") ||
+                    j.includes("not available to this subagent") ||
+                    j.includes("operator tool policy")
                 ) { refused = true; break; }
             }
             results["T12 nested delegation runtime-guarded in fork child"] = refused;
