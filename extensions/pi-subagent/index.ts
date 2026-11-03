@@ -755,13 +755,23 @@ async function runSingleAgent(
 		step,
 	};
 
+	// Live-view pump: the RPC child accumulates messages/usage in its own
+	// object (currentResult is only harvested at the end) — so onUpdate MUST
+	// read from the live child, or the foreground tool view shows nothing
+	// until completion. (Regression from the 0.3.3 foreground→RPC rewrite.)
+	let fgRpc: RpcSubagent | undefined;
 	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
+		if (!onUpdate) return;
+		if (fgRpc) {
+			currentResult.messages = fgRpc.messages as Message[];
+			currentResult.usage = { ...fgRpc.usage };
+			if (fgRpc.model) currentResult.model = fgRpc.model;
+			if (fgRpc.stopReason) currentResult.stopReason = fgRpc.stopReason;
 		}
+		onUpdate({
+			content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+			details: makeDetails([currentResult]),
+		});
 	};
 
 	try {
@@ -804,6 +814,7 @@ Follow these instructions exactly for your response.` : task;
 			env,
 			logPath: fgLogPath,
 		});
+		fgRpc = rpc;
 		rpc.onMessage(() => emitUpdate());
 		// Broken model/config: pi rejects the prompt before any activity →
 		// fail fast instead of waiting on a child that never produces.

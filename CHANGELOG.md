@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.6
+
+### Fixed
+
+- **Foreground subagents showed no live output** — the 0.3.3 foreground→RPC
+  rewrite left the streaming pump (`onUpdate`) reading the pre-harvest empty
+  `currentResult.messages`, so the tool view sat at "(running...)" until the
+  child finished (or you interrupted it). `emitUpdate` now mirrors the live
+  RPC child (messages, usage, model, stopReason) on every `message_end`, so
+  partial answers and the usage line stream as they happen.
+
 ## 0.4.5
 
 ### Fixed

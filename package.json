@@ -1,7 +1,7 @@
 {
   "name": "pi-subagent",
-  "version": "0.4.5",
-  "description": "Delegate tasks to isolated subagents in pi — single, parallel, and chain modes, with bundled sample agents, prompt templates, and searchable run history.",
+  "version": "0.4.6",
+  "description": "Delegate tasks to isolated subagents in pi \u2014 single, parallel, and chain modes, with bundled sample agents, prompt templates, and searchable run history.",
   "license": "MIT",
   "type": "module",
   "keywords": [
