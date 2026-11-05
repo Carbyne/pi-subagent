@@ -22,6 +22,8 @@ cannot pollute yours. Supports single, parallel, and chained execution.
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono) ≥ 0.84
+- **Optional but recommended: [pi-bg-jobs](https://github.com/Carbyne/pi-bg-jobs)** — background subagents register themselves as real jobs via the `bg-jobs:adopt` event. Without it, background runs still work (own list/kill/notifications), but they are invisible to `bg_jobs`/`/bg-list`/the sidebar, and `pi-ralph-loop` will not wait on them.
+- **Optional: [pi-sudo-grant](https://github.com/Carbyne/pi-sudo-grant)** — irrelevant by design: sudo never propagates into subagent children (hard refusal + tool exclusions + askpass poisoning).
 - Linux / macOS recommended. Each subagent is spawned as a child process and killed via
   POSIX signals; **Windows is best-effort** — process-group kills degrade to direct
   termination and the parent↔child mailbox uses named pipes
