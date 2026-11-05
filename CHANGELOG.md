@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7
+
+### Added
+
+- **Sudo is now contractually main-agent-only.** Children never receive any
+  sudo capability — previously this was incidental (no grant state in a fresh
+  child instance, `hasUI` gate, setsid kills the tty-keyed credential cache);
+  now it's explicit defence-in-depth:
+  - `request_sudo_access` / `revoke_sudo_access` are added to every child's
+    CLI exclusion list (fresh) and to the default runtime `block` policy
+    (guard) / loadout block (real mode) — fork children keep the *declarations*
+    (cache parity) but any call is refused and audit-logged by sudo-grant's
+    new child guard
+  - child env: `SUDO_ASKPASS`/`SSH_ASKPASS`/`GIT_ASKPASS` are poisoned to
+    `/bin/false` (a child can never reach an askpass even if the parent had one)
+  - pi-sudo-grant 0.1.1 refuses `enableSudo` outright when
+    `PI_SUBAGENT_CHILD`/`PI_SUBAGENT_TOKEN` is present in the process env
+
 ## 0.4.6
 
 ### Fixed

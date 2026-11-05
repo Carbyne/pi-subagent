@@ -659,6 +659,8 @@ async function runSingleAgent(
 	const blockForDelegation = (): string[] => {
 		const block = [...(toolPolicy?.blockExtra ?? [])];
 		if (!allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+		// Sudo is main-agent-only by design: children never request grants.
+		block.push("request_sudo_access", "revoke_sudo_access");
 		return block;
 	};
 	if (enforce === "guard" && forkFrom) {
@@ -685,7 +687,7 @@ async function runSingleAgent(
 		// (each is a full pi startup; parallel mode would fan out unboundedly).
 		// Skip when tools are already fully disabled. Set allowNesting to opt in.
 		if (!allowNesting && !noTools) {
-			args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+			args.push("--exclude-tools", "subagent,search_subagent,subagent_control,request_sudo_access,revoke_sudo_access");
 		}
 	}
 	if (piArgs && piArgs.length > 0) args.push(...piArgs);
@@ -723,6 +725,10 @@ async function runSingleAgent(
 	}
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	if (forkFrom && !allowNesting) env.PI_SUBAGENT_CHILD = "1";
+	// Children never reach an askpass/sudo path (sudo is main-agent-only).
+	env.SUDO_ASKPASS = "/bin/false";
+	env.SSH_ASKPASS = "/bin/false";
+	env.GIT_ASKPASS = "/bin/false";
 	if (guardPolicyJson) env.PI_SUBAGENT_TOOL_POLICY = guardPolicyJson;
 	if (loadoutJson) env.PI_SUBAGENT_TOOL_LOADOUT = loadoutJson;
 	if (forkFrom && !mailToken) args.push("--extension", COMPANION_PATH); // companion carries the policy/loadout even without a mailbox
@@ -1347,6 +1353,7 @@ export default function (pi: ExtensionAPI) {
 			// provider family; additions are cache-safe.
 			const block = [...(opts.toolPolicy?.blockExtra ?? [])];
 			if (!opts.allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+			block.push("request_sudo_access", "revoke_sudo_access");
 			const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
 			if (allow || block.length > 0) loadoutJson = JSON.stringify({ allow, block });
 			toolNote = "tools changed for real via pi loadout — removals forfeit the parent KV prefix";
@@ -1354,13 +1361,14 @@ export default function (pi: ExtensionAPI) {
 			if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 			else if (noTools) args.push("--no-tools");
 			if (!opts.allowNesting && !noTools) {
-				args.push("--exclude-tools", "subagent,search_subagent,subagent_control");
+				args.push("--exclude-tools", "subagent,search_subagent,subagent_control,request_sudo_access,revoke_sudo_access");
 			}
 		} else {
 			// Guard mode (fork, cache-preserving): parent's exact declarations;
 			// restrictions ride as a runtime policy enforced by companion.
 			const block = [...(opts.toolPolicy?.blockExtra ?? [])];
 			if (!opts.allowNesting) block.push("subagent", "search_subagent", "subagent_control");
+			block.push("request_sudo_access", "revoke_sudo_access");
 			if (noTools) block.push("*");
 			const allow = agent.tools && agent.tools.length > 0 ? agent.tools : undefined;
 			if (allow || block.length > 0) guardPolicyJson = JSON.stringify({ allow, block });
@@ -1400,6 +1408,9 @@ Follow these instructions exactly for your response.`
 		const token = newToken();
 		const env: NodeJS.ProcessEnv = { ...process.env };
 		if (isFork && !opts.allowNesting) env.PI_SUBAGENT_CHILD = "1";
+		env.SUDO_ASKPASS = "/bin/false";
+		env.SSH_ASKPASS = "/bin/false";
+		env.GIT_ASKPASS = "/bin/false";
 		if (guardPolicyJson) env.PI_SUBAGENT_TOOL_POLICY = guardPolicyJson;
 		if (loadoutJson) env.PI_SUBAGENT_TOOL_LOADOUT = loadoutJson;
 		if (mailboxUp && hub.socketPath && !isFork) {
