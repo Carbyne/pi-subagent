@@ -330,6 +330,43 @@ async function t3() {
     await sleep(200);
     await commands["unqueue"]("", ctx);
     results["T3 unqueue to editor"] = (globalThis as any).__editorText === "recall me";
+
+    // 7) steered commands are HELD until the tool boundary (last-mile
+    //    handoff) and arrive with deliverAs:"steer" — the bug this fixes:
+    //    immediate core handoff made /unqueue unable to recall them.
+    idle = false;
+    await submit("STEER-BY-BOUNDARY", "s");
+    await sleep(200);
+    const heldNotSent = !sent.some((m) => m.text === "STEER-BY-BOUNDARY");
+    await fire("tool_result", {});
+    await sleep(150);
+    results["T3 steer held until tool boundary"] = heldNotSent;
+    results["T3 steer handed off at boundary (deliverAs steer)"] =
+        sent.some((m) => m.text === "STEER-BY-BOUNDARY" && m.opts?.deliverAs === "steer");
+
+    // 8) /unqueue recalls an armed steer BEFORE the boundary → never sent
+    idle = false;
+    await submit("STEER-RECALLED", "s");
+    await sleep(200);
+    await commands["unqueue"]("", ctx);
+    await fire("tool_result", {});
+    await fire("turn_end", {});
+    await sleep(150);
+    results["T3 unqueue recalls armed steer"] =
+        !sent.some((m) => m.text === "STEER-RECALLED") &&
+        (globalThis as any).__editorText === "STEER-RECALLED";
+
+    // 9) steer still armed when the agent settles → delivered as a NORMAL
+    //    send (re-steering an idle agent makes no sense)
+    idle = false;
+    await submit("STEER-LEFTOVER", "s");
+    await sleep(150);
+    idle = true;
+    await fire("agent_settled", {});
+    results["T3 leftover steer delivered at settle"] = await expectSent("STEER-LEFTOVER");
+    results["T3 leftover steer sent as normal send"] = sent.some(
+        (m) => m.text === "STEER-LEFTOVER" && m.opts?.deliverAs === undefined
+    );
 }
 
 // ── run ───────────────────────────────────────────────────────────────────────
