@@ -511,6 +511,10 @@ async function t10() {
         }
     }
     results["T10 foreground interrupt reported"] = reported;
+    // Budget must stay STRICTLY under the 30s child sleep — a wider window
+    // would let “abort only honored after waiting the sleep out” pass.
+    // Gateway round-trip variance (which pushed dt >25s under load twice)
+    // is absorbed by the runner's retry, not by widening this bound.
     results["T10 interrupt fast (not waiting out the sleep)"] = reported && dt >= 0 && dt < 25_000;
     s.stop();
     await sleep(1000);
@@ -518,6 +522,13 @@ async function t10() {
 if (!process.env.SKIP_T10) {
     console.log("── T10 foreground Ctrl+C e2e (installed)");
     await t10();
+    if (!(results["T10 foreground interrupt reported"] && results["T10 interrupt fast (not waiting out the sleep)"])) {
+        // Known flake source: dt measures a real gateway round-trip; under
+        // concurrent load it can exceed 25s even when abort semantics are
+        // perfect. One retry distinguishes latency noise from regression.
+        console.log("── T10 retry (possible gateway-latency flake)");
+        await t10();
+    }
     console.log(JSON.stringify(results, null, 0));
 }
 // ── T11: sessionMode fork continues the parent conversation; fresh does not ──
