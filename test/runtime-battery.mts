@@ -176,10 +176,12 @@ async function t3() {
     const fixture = "/tmp/steer-fixture";
     fs.mkdirSync(`${fixture}/.pi`, { recursive: true });
     fs.writeFileSync(`${fixture}/.pi/settings.json`, JSON.stringify({ agentSteer: { } }));
+    let abortCalls = 0;
     const ctx: any = {
         cwd: fixture,
         hasUI: true,
         isIdle: () => idle,
+        abort: () => { abortCalls++; },
         ui: {
             custom: (factory: Function) =>
                 new Promise((resolve) => {
@@ -367,6 +369,32 @@ async function t3() {
     results["T3 leftover steer sent as normal send"] = sent.some(
         (m) => m.text === "STEER-LEFTOVER" && m.opts?.deliverAs === undefined
     );
+
+    // 10) i = interrupt & send: ctx.abort() fired, message held in our queue
+    //     first (never-lose), delivered as a NORMAL send once the aborted
+    //     run settles.
+    idle = false;
+    abortCalls = 0;
+    await submit("INTERRUPT-SEND", "i");
+    await sleep(200);
+    results["T3 interrupt calls ctx.abort"] = abortCalls > 0;
+    results["T3 interrupt holds send until settle"] = !sent.some((m) => m.text === "INTERRUPT-SEND");
+    idle = true;
+    await fire("agent_settled", { aborted: true });
+    results["T3 interrupt delivered after settle"] = await expectSent("INTERRUPT-SEND");
+    results["T3 interrupt sent as normal (no deliverAs)"] = sent.some(
+        (m) => m.text === "INTERRUPT-SEND" && m.opts?.deliverAs === undefined
+    );
+
+    // 11) /interrupt command while busy: abort + queue, deliver on settle
+    idle = false;
+    abortCalls = 0;
+    await commands["interrupt"]("INT-CMD msg", ctx);
+    await sleep(200);
+    results["T3 /interrupt aborts & holds"] = abortCalls > 0 && !sent.some((m) => m.text === "INT-CMD msg");
+    idle = true;
+    await fire("agent_settled", {});
+    results["T3 /interrupt delivers after settle"] = await expectSent("INT-CMD msg");
 }
 
 // ── run ───────────────────────────────────────────────────────────────────────
