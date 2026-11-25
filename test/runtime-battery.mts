@@ -51,19 +51,24 @@ async function rpcSession(extraArgs: string[], tag: string, cwd = "/home/jakob/g
 // ── T1: ralph-loop ────────────────────────────────────────────────────────────
 async function t1() {
     const s = await rpcSession(["--thinking", "off"], "ralph");
+    // Poll-until-deadline, never fixed-time snapshots: session bring-up
+    // (jiti load of installed extensions + gateway warm) raced the old
+    // 3.5s/7s snapshots and produced startup-dependent false failures.
+    const waitFor = async (pred: () => boolean, ms: number) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (pred()) return true; await sleep(500); } return false; };
     s.send({ type: "prompt", message: "/ralph-config --max 5 --delay 1s installed-ralph-test" });
-    await sleep(3500);
     const notifyTexts = () =>
         s.events
             .filter((e) => e.type === "extension_ui_request" && e.method === "notify")
             .map((e) => e.message ?? "")
             .join("\n");
-    results["T1 config-while-inactive"] = /config saved \(loop not active/.test(notifyTexts());
+    results["T1 config-while-inactive"] = await waitFor(() => /config saved \(loop not active/.test(notifyTexts()), 30_000);
     s.send({ type: "prompt", message: "/ralph-resume" });
-    await sleep(7000);
-    results["T1 resumed"] = /Ralph loop resumed at iteration/.test(notifyTexts());
-    results["T1 followup-fired"] = s.events.some(
-        (e) => e.type === "message_start" && e.message?.role === "user" && /\[ralph-loop\]/.test(JSON.stringify(e.message.content ?? ""))
+    results["T1 resumed"] = await waitFor(() => /Ralph loop resumed at iteration/.test(notifyTexts()), 30_000);
+    results["T1 followup-fired"] = await waitFor(
+        () => s.events.some(
+            (e) => e.type === "message_start" && e.message?.role === "user" && /\[ralph-loop\]/.test(JSON.stringify(e.message.content ?? ""))
+        ),
+        30_000
     );
     s.send({ type: "prompt", message: "/ralph-stop" });
     await sleep(2000);
