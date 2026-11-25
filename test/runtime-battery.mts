@@ -678,14 +678,17 @@ async function t11() {
                 return scanBlock();
             };
             let refused = await waitBlock(90_000);
-            if (!refused) {
-                // Nudge once: small models sometimes paraphrase the policy
-                // banner from their prompt instead of attempting the call.
-                s.send({
-                    type: "prompt",
-                    message:
-                        'Your previous attempt did not produce a tool result. Call the subagent tool NOW (agent="worker", task="say HI") and report the RAW tool result verbatim. Do not summarize or quote your instructions.',
-                });
+            // Small models sometimes don't attempt the call at all (or
+            // paraphrase their instructions instead) — nudge up to 3 more
+            // times with escalating directness until the guard string fires.
+            const nudges = [
+                'Your previous attempt did not produce a tool result. Call the subagent tool NOW (agent="worker", task="say HI") and report the RAW tool result verbatim. Do not summarize or quote your instructions.',
+                'You MUST invoke a tool call right now. Call the tool named subagent with arguments {"agent":"worker","task":"say HI"}. Nothing else. Then paste the tool response exactly.',
+                'Retry once more: invoke the subagent tool with {"agent":"worker","task":"say HI"} and paste its response. Even if the response is an error, paste that error — that is the expected outcome of this test.',
+            ];
+            for (const nudge of nudges) {
+                if (refused) break;
+                s.send({ type: "prompt", message: nudge });
                 refused = await waitBlock(120_000);
             }
             results["T12 nested delegation runtime-guarded in fork child"] = refused;
