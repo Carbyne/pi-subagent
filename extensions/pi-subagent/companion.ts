@@ -14,6 +14,7 @@
 
 import * as fs from "node:fs";
 import * as net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { matchAny } from "./util.ts";
@@ -49,8 +50,11 @@ class MailboxClient {
                 this.socket = socket;
                 resolve();
             });
+            // Per-connection chunk-boundary-safe decode (large answers with
+            // multi-byte chars would otherwise corrupt → JSON.parse drops).
+            const decoder = new StringDecoder("utf8");
             socket.on("data", (data) => {
-                this.buffer += data.toString("utf8");
+                this.buffer += decoder.write(data);
                 let idx: number;
                 while ((idx = this.buffer.indexOf("\n")) >= 0) {
                     const line = this.buffer.slice(0, idx).replace(/\r$/, "").trim();

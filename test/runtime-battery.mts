@@ -722,6 +722,16 @@ if (!process.env.SKIP_T11) {
     await t11();
     console.log(JSON.stringify(results, null, 0));
 }
+// ── T14: pipe/stdio hardening (Windows crash fixes) — spawns test/winfix-pipes.mts ──
+if (!process.env.SKIP_T14) {
+    console.log("── T14 stdin-EPIPE + multi-byte chunk decode (winfix)");
+    const { spawnSync } = await import("node:child_process");
+    const r = spawnSync(process.execPath, ["--experimental-strip-types", "test/winfix-pipes.mts"], { cwd: process.cwd(), encoding: "utf8", timeout: 180_000 });
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    results["T14 winfix suite green"] = r.status === 0 && out.includes("WINFIX PASS");
+    if (r.status !== 0) console.log(out.split("\n").filter((l) => l.includes("FAIL") || l.includes("THREW")).join("\n"));
+    console.log(JSON.stringify(results, null, 0));
+}
 const fails = Object.entries(results).filter(([, v]) => v !== true);
 console.log(fails.length === 0 ? "ALL TESTS PASS" : `FAILURES: ${fails.map(([k]) => k).join(", ")}`);
 process.exit(fails.length === 0 ? 0 : 1);

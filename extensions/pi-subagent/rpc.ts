@@ -12,6 +12,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { appendFileSync, openSync, closeSync } from "node:fs";
 import { formatAge } from "./util.ts";
 
@@ -89,6 +90,9 @@ export class RpcSubagent {
     };
     model: string | undefined;
     stopReason: string | undefined;
+    /** Chunk-boundary-safe UTF-8 decoding for the JSONL readers. */
+    private stdoutDecoder = new StringDecoder("utf8");
+    private stderrDecoder = new StringDecoder("utf8");
     /** True once kill() was called by us (vs. child death). */
     expectedKill = false;
     running = false;
@@ -141,16 +145,26 @@ export class RpcSubagent {
             this.proc.on("close", (code) => finish(code));
             this.proc.on("error", () => finish(1));
         });
+        // Writes to a killed child surface asynchronously as an 'error'
+        // event on the stdin stream — EPIPE on a writable without a listener
+        // is an uncaughtException that kills the HOST process (observed as
+        // the Windows crash on large prompts: big JSONL splits into many
+        // pipe chunks, the child dies between them). Swallow it; send()
+        // already reports failure via `exited`.
+        this.proc.stdin?.on("error", () => { /* dead child — ignore */ });
 
         this.proc.stdout?.on("data", (data: Buffer) => {
             this.writeLog(data);
-            this.buffer += data.toString("utf8");
+            // Chunk-boundary-safe decode: per-chunk toString() corrupts any
+            // multi-byte UTF-8 char split across chunks (🚨 in a large final
+            // output → JSON.parse fails → whole line silently dropped).
+            this.buffer += this.stdoutDecoder.write(data);
             const lines = this.buffer.split("\n");
             this.buffer = lines.pop() ?? "";
             for (const line of lines) this.handleEventLine(line);
         });
         this.proc.stderr?.on("data", (data: Buffer) => {
-            const text = data.toString("utf8");
+            const text = this.stderrDecoder.write(data);
             this.stderrTail = (this.stderrTail + text).slice(-4000);
             try {
                 appendFileSync(this.logPath, `[stderr] ${text}`);
@@ -161,6 +175,8 @@ export class RpcSubagent {
     }
 
     private flushBuffer(): void {
+        const tail = this.stdoutDecoder.end();
+        if (tail) this.buffer += tail;
         if (this.buffer.trim()) {
             this.handleEventLine(this.buffer);
             this.buffer = "";

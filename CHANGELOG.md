@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.9
+
+### Fixed
+
+- **Windows crash on large return prompts / outputs.** Writes to a killed or
+  dying child's stdin surface ASYNCHRONOUSLY as an `'error'` event on the
+  stdin stream — with no listener, EPIPE becomes an uncaughtException that
+  takes down the whole main pi process. Small writes often slip into the pipe
+  buffer before the child dies; large ones (big `returnPrompt` payloads sent
+  as JSONL) span many chunks and reliably hit it — hence “large prompts
+  crash, small ones don't”, Windows-first (8 KB pipe buffers, different
+  teardown timing). `RpcSubagent` now attaches a stdin error listener; `send()`
+  already reports failure via `exited`.
+- **Multi-byte corruption at chunk boundaries.** The four JSONL readers
+  (rpc stdout/stderr, mailbox hub, companion client) decoded each socket
+  chunk independently with `data.toString("utf8")`; any UTF-8 sequence split
+  across chunks (🚨, quotes, CJK) became U+FFFD → `JSON.parse` failed → the
+  whole line was silently dropped. Large outputs make splits far more likely.
+  All readers now use `node:string_decoder` per stream/connection, with
+  decoder-end flush on close.
+
+### Added
+
+- `test/winfix-pipes.mts` (also wired into the runtime battery as T14):
+  2 MB stdin writes to a dead child must not raise an uncaught exception;
+  a ~780 KB multi-byte mailbox question dribbled through the socket in
+  32 KB chunks (deliberately splitting emoji) must arrive intact; a 240 KB
+  stdout line chunked at mid-sequence offsets must parse to the exact string.
+
 ## 0.4.8
 
 ### Fixed

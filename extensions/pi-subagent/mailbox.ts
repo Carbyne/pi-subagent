@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 
 export interface IncomingQuestion {
     qid: number;
@@ -137,8 +138,9 @@ export class MailboxHub {
     private onConnection(socket: net.Socket): void {
         let buffer = "";
         let token: string | undefined;
+        const decoder = new StringDecoder("utf8");
         socket.on("data", (data) => {
-            buffer += data.toString("utf8");
+            buffer += decoder.write(data);
             let idx: number;
             while ((idx = buffer.indexOf("\n")) >= 0) {
                 const line = buffer.slice(0, idx).replace(/\r$/, "").trim();
@@ -167,6 +169,11 @@ export class MailboxHub {
             }
         });
         socket.on("error", () => socket.destroy());
+        socket.on("end", () => {
+            // Flush any multi-byte tail held by the decoder, then process
+            // whatever complete lines remain (no trailing \n case).
+            buffer += decoder.end();
+        });
         socket.on("close", () => {
             for (const route of this.routes.values()) route.sockets.delete(socket);
         });
