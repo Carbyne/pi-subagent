@@ -855,7 +855,7 @@ Follow these instructions exactly for your response.` : task;
 		rpc.prompt(`Task: ${forkFrom ? toolPolicy?.disabledNote ?? "" : ""}${fullTask}`);
 		// RPC children stay warm after settling — one-shot semantics for
 		// foreground: wait for the answer, then terminate the process.
-		await rpc.waitSettled(3600_000, signal);
+		const settleOutcome = await rpc.waitSettled(3600_000, signal);
 		rpc.kill();
 		const exitCode = await rpc.exit;
 		clearTimeout(startupGuard);
@@ -878,7 +878,10 @@ Follow these instructions exactly for your response.` : task;
 		}
 		emitUpdate();
 
-		currentResult.exitCode = wasAborted ? 1 : exitCode ?? 0;
+		// We SIGTERM our own child once the answer has settled — pi exits 143
+		// on SIGTERM, which is OUR teardown, not a failure. Only a real
+		// settle (or clean self-exit) counts as success; abort/timeout don't.
+		currentResult.exitCode = wasAborted ? 1 : settleOutcome === "settled" ? 0 : (exitCode ?? 0);
 		if (wasAborted) {
 			const childErr = currentResult.errorMessage;
 			currentResult.stopReason = "aborted";

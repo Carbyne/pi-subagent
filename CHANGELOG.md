@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.8
+
+### Fixed
+
+- **Foreground (and chain/parallel) subagent runs reported as failed
+despite succeeding.** When foreground delegation moved from one-shot `pi -p`
+children to warm RPC children, teardown became: the answer settles, then we
+SIGTERM the child ourselves — and `pi --mode rpc` exits with code **143**
+(128+SIGTERM) instead of being signal-killed. The result classifier keyed on
+`exitCode !== 0`, so every successful foreground run was error-wrapped
+(`Agent failed: …` / ✗ / `isError: true`) despite carrying the perfect output.
+Classification now anchors on the settle event: settled → success regardless
+of our own kill's exit code. Genuine failures are untouched: user-abort still
+reports aborted, and startup-timeout / prompt-reject / broken-model kills
+fire only pre-settle (`settleRounds === 0`) and keep their failure status.
+Background runs were largely unaffected (idle-kills set `wasKilled`; settled
+rounds close adoption with 0). Battery gains a T11 assertion for it
+(`fg success not misreported as failed`), since content-based checks had been
+passing right through the bug.
+
 ## 0.4.7
 
 ### Added

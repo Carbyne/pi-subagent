@@ -89,6 +89,8 @@ export class RpcSubagent {
     };
     model: string | undefined;
     stopReason: string | undefined;
+    /** True once kill() was called by us (vs. child death). */
+    expectedKill = false;
     running = false;
     startedAt = Date.now();
     lastActivityAt = Date.now();
@@ -356,6 +358,8 @@ export class RpcSubagent {
 
     /** Terminate the whole process group. */
     kill(signal: NodeJS.Signals = "SIGTERM"): void {
+        this.expectedKill = true; // our own teardown — pi exits 143 on SIGTERM;
+        // callers that already got a settled answer must not read that as failure
         const pid = this.proc.pid;
         if (!pid) return;
         const fire = (sig: NodeJS.Signals) => {

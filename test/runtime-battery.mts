@@ -599,6 +599,7 @@ async function t11() {
             const t0 = Date.now();
             let answered = false;
             let leaked = false;
+            let fgNoFalseFail = false;
             while (Date.now() - t0 < 150_000) {
                 await sleep(1500);
                 const trs = s.events.filter(
@@ -609,11 +610,16 @@ async function t11() {
                     const txt = JSON.stringify(hit.message?.content ?? "");
                     answered = true;
                     leaked = txt.includes("ZEBRA-88-NOPEE");
+                    // Regression guard: our own SIGTERM teardown makes pi exit
+                    // 143 — a settled foreground run must NOT be reported as an
+                    // error toolResult (the 0.4.7-and-below false-failure bug).
+                    fgNoFalseFail = hit.message?.isError !== true;
                     break;
                 }
             }
             results["T11 fresh child answered"] = answered;
             results["T11 fresh did NOT leak token"] = answered && !leaked;
+            results["T11 fg success not misreported as failed (143 fix)"] = answered && fgNoFalseFail;
         }
         s.stop();
         await sleep(800);
